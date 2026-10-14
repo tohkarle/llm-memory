@@ -428,6 +428,16 @@ class Journal:
 
     # ------------------------------------------------------------------ writing
 
+    def reserve_op_id(self) -> str:
+        """Mint an op id before :meth:`begin`.
+
+        Pre-images must be copied into the undo area *before* intent is
+        recorded (the plan references their paths), and the undo area is keyed
+        by op id -- so the id has to exist first. Pass it back to ``begin``.
+        """
+        self._require_lock()
+        return new_op_id()
+
     def begin(
         self,
         kind: OpKind,
@@ -435,10 +445,11 @@ class Journal:
         plan: list[Step],
         *,
         db: dict[str, list[str]] | None = None,
+        op_id: str | None = None,
     ) -> str:
         """Record intent. Returns the ``op_id`` to pass to commit/abort."""
         self._require_lock()
-        op_id = new_op_id()
+        op_id = op_id or new_op_id()
         record = JournalRecord(
             op_id=op_id,
             seq=self._next_seq(),
