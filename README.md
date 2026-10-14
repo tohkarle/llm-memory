@@ -33,8 +33,10 @@ The CLI emits a JSON envelope on stdout (`{"ok": true, "data": {...}}`); logs go
 stderr. `mem context --format markdown` is the one command that prints prose, because
 it is meant to be pasted into a prompt.
 
-An optional MCP server (`uv sync --extra mcp`) exposes the same operations to
-MCP clients: `python -m memory.mcp_server`.
+An optional MCP server (`uv sync --extra mcp`) exposes the same 15 operations
+to MCP clients over stdio: `python -m memory.mcp_server`. Set `MEMORY_ROOT` to
+choose the data directory. Destructive tools are annotated as such, and
+permanent deletion requires `confirm: true`.
 
 ## Design
 
