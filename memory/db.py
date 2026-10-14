@@ -405,8 +405,15 @@ def integrity_check(conn: sqlite3.Connection) -> list[str]:
     # index's internal structure -- it will happily pass over an index that
     # disagrees with `memories`. The rank=1 argument is what compares the two,
     # which is the check that actually holds manual sync honest.
+    # The check is issued as an INSERT, so it needs a writable connection. On
+    # a read-only one it fails with "readonly database", which is not
+    # corruption -- reporting it would make `mem doctor` and `mem verify`
+    # always claim a broken index.
     try:
         conn.execute("INSERT INTO memories_fts(memories_fts, rank) VALUES('integrity-check', 1)")
+    except sqlite3.OperationalError as exc:
+        if "readonly" not in str(exc).lower():
+            problems.append(f"fts integrity: {exc}")
     except sqlite3.DatabaseError as exc:
         problems.append(f"fts integrity: {exc}")
     for row in conn.execute("PRAGMA foreign_key_check"):

@@ -10,12 +10,17 @@ relationships — delete `data/index/memory.sqlite` at any time and run `mem reb
 
 ```bash
 uv sync --extra dev
-uv run mem init
-uv run mem create --type preference --title "Prefers uv over pip" \
+uv run python -m memory init
+uv run python -m memory create --type preference --title "Prefers uv over pip" \
   --body "Uses uv for all Python projects." --profile --tag tooling
-uv run mem search "uv"
-uv run mem context "python tooling" --budget 800 --format markdown
+uv run python -m memory search "uv"
+uv run python -m memory context "python tooling" --budget 800 --format markdown
+uv run python -m memory doctor
 ```
+
+Installed non-editable (`uv pip install .`), the same commands are available
+as `mem`. Under an editable install, prefer `python -m memory`: the console
+script relies on a `.pth` path hook that some environments do not honor.
 
 ## How agents use it
 
@@ -28,8 +33,8 @@ The CLI emits a JSON envelope on stdout (`{"ok": true, "data": {...}}`); logs go
 stderr. `mem context --format markdown` is the one command that prints prose, because
 it is meant to be pasted into a prompt.
 
-An optional MCP server (`uv sync --extra mcp`) exposes the same operations to MCP
-clients: `python -m memory.mcp_server`.
+An optional MCP server (`uv sync --extra mcp`) exposes the same operations to
+MCP clients: `python -m memory.mcp_server`.
 
 ## Design
 
@@ -60,8 +65,9 @@ Set `$MEMORY_ROOT` or pass `--root` to use a data directory elsewhere.
 ## Development
 
 ```bash
-uv run pytest                    # full suite
-uv run mypy --strict src/memory
+uv run pytest                        # full suite
+uv run mypy                          # strict, configured in pyproject
 uv run ruff check . && uv run ruff format --check .
-uv run mem doctor                # environment + index health
+uv run python -m memory doctor       # environment + index health
+uv run python -m memory verify       # filesystem vs. index divergence
 ```
