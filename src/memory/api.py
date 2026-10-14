@@ -18,6 +18,7 @@ from types import TracebackType
 from typing import Any, Self
 
 from . import db
+from .context import ContextResult, get_context
 from .journal import Journal, RecoveryReport
 from .models import (
     SENSITIVITY_ORDER,
@@ -631,6 +632,23 @@ class MemoryAPI:
     def get_related(self, mid: str, **kwargs: Any) -> list[RelatedHit]:
         return get_related(self.conn, mid, **kwargs)
 
+    def get_context(
+        self,
+        query: str = "",
+        *,
+        token_budget: int = 2000,
+        filters: SearchFilters | None = None,
+        **kwargs: Any,
+    ) -> ContextResult:
+        """Assemble a token-budgeted context pack. See :mod:`memory.context`."""
+        return get_context(
+            self.conn,
+            query,
+            token_budget=token_budget,
+            filters=filters,
+            **kwargs,
+        )
+
     def profile(self, *, limit: int = 50) -> list[Hit]:
         """Memories flagged as always-relevant."""
         return profile_memories(self.conn, limit=limit)
@@ -1132,6 +1150,7 @@ def _apply_patch(current: Memory, patch: dict[str, Any]) -> Memory:
 
 __all__ = [
     "Conflict",
+    "ContextResult",
     "DeleteResult",
     "Hit",
     "MemoryAPI",

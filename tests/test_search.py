@@ -365,9 +365,7 @@ class TestRanking:
         second = seed(api, title="Second", body="ordered")
         with api.journal:
             api.store.overwrite(
-                api.require(first.id).with_updates(
-                    updated_at=datetime(2020, 1, 1, tzinfo=UTC)
-                )
+                api.require(first.id).with_updates(updated_at=datetime(2020, 1, 1, tzinfo=UTC))
             )
         api._reindex_one(first.id)
         api.conn.commit()
