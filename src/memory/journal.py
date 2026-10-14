@@ -12,6 +12,7 @@ mandatory on every step that touches content.
 
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import hashlib
 import json
@@ -237,10 +238,18 @@ def atomic_write(path: Path, data: bytes, *, tmp_suffix: str | None = None) -> N
         finally:
             os.close(fd)
         os.replace(tmp, path)
-        _fsync_dir(path.parent)
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
+
+    # Past this point the rename has happened and the new content IS the file.
+    # Syncing the directory only hardens that against power loss, so a failure
+    # here must not be reported as a failed write: callers treat an exception
+    # as "nothing landed" and would abort, leaving the old file beside the new
+    # one. Worth noting the sync is best-effort anyway -- a real SIGKILL never
+    # reaches this line.
+    with contextlib.suppress(BaseException):
+        _fsync_dir(path.parent)
 
 
 def _fsync_dir(directory: Path) -> None:
@@ -517,6 +526,29 @@ class Journal:
         _fsync_dir(dest.parent)
         return self.paths.rel(dest)
 
+    def _sweep_orphan_undo(self, *, dry_run: bool = False) -> list[str]:
+        """Remove every undo directory that no longer protects an open op.
+
+        Pre-images exist only to roll back an operation still in flight. Two
+        ways one outlives its purpose: a crash between ``backup()`` and
+        ``begin()`` leaves a directory no journal record mentions, and a crash
+        during ``commit()`` can interrupt the discard. In both cases the
+        directory is unreferenced garbage, and keeping it would grow the undo
+        area without bound -- so anything not belonging to a currently open op
+        is swept.
+        """
+        if not self.paths.undo_dir.exists():
+            return []
+        protected = {r.op_id for r in self.open_ops()}
+        warnings: list[str] = []
+        for entry in sorted(self.paths.undo_dir.iterdir()):
+            if not entry.is_dir() or entry.name in protected:
+                continue
+            warnings.append(f"discarded stale pre-image for {entry.name}")
+            if not dry_run:
+                shutil.rmtree(entry, ignore_errors=True)
+        return warnings
+
     def _discard_undo(self, op_id: str) -> None:
         shutil.rmtree(self.paths.undo_dir / op_id, ignore_errors=True)
 
@@ -624,6 +656,10 @@ class Journal:
                 report.reindex.extend(record.targets)
 
             self._clean_tmp(record)
+
+        # Swept last: until the loop above settles them, open ops still need
+        # their pre-images.
+        report.warnings.extend(self._sweep_orphan_undo(dry_run=dry_run))
 
         return report
 

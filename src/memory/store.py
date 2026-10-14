@@ -273,6 +273,11 @@ class Store:
         # area is keyed by op id, so the id is reserved up front.
         pre_op = self.journal.reserve_op_id()
         backup = self.journal.backup(pre_op, 0, current_path)
+        # On a move the new path has no pre-image -- nothing was there before,
+        # so rolling back means deleting it, not restoring a backup. The
+        # pre-image belongs solely to the old path, whose unlink step carries
+        # it. Attaching it to both steps would resurrect the file at the new
+        # location and leave two files sharing one id.
         plan.append(
             Step(
                 i=0,
@@ -280,8 +285,8 @@ class Store:
                 path=self.paths.rel(target),
                 new_hash=new_hash,
                 new_bytes=len(payload),
-                prev_hash=existing_hash if not moving else None,
-                prev_backup=backup,
+                prev_hash=None if moving else existing_hash,
+                prev_backup=None if moving else backup,
                 from_path=self.paths.rel(current_path) if moving else None,
             )
         )
@@ -305,11 +310,18 @@ class Store:
         )
         try:
             atomic_write(target, payload, tmp_suffix=f".tmp-{op_id}")
-            if moving:
-                current_path.unlink(missing_ok=True)
         except BaseException:
+            # Nothing landed, so the pre-image is still the truth: abort and
+            # let the old file stand.
             self.journal.abort(op_id, "overwrite failed")
             raise
+
+        if moving:
+            # The new file is durable now. Removing the old one must not be
+            # skippable -- an abort here would leave two files sharing one id,
+            # so this runs before the caller commits and any failure leaves
+            # the op open for recovery to finish.
+            current_path.unlink(missing_ok=True)
         self._path_cache[m.id] = target
         return WriteResult(target, op_id, new_hash)
 
@@ -389,12 +401,13 @@ class Store:
         op_id = self.journal.begin(
             OpKind.PURGE_MEMORY, [mid], plan, db={"unindex": [mid]}, op_id=pre_op
         )
-        try:
-            atomic_write(tomb_path, tomb_payload, tmp_suffix=f".tmp-{op_id}")
-            path.unlink(missing_ok=True)
-        except BaseException:
-            self.journal.abort(op_id, "purge failed")
-            raise
+        # Deliberately no abort-on-failure here. Once the tombstone is
+        # durable the intent to destroy is recorded, and aborting would leave
+        # a tombstone next to a live memory file -- two files disagreeing
+        # about whether the memory exists. Leaving the op open hands it to
+        # recovery, which rolls destructive operations forward.
+        atomic_write(tomb_path, tomb_payload, tmp_suffix=f".tmp-{op_id}")
+        path.unlink(missing_ok=True)
         self._path_cache.pop(mid, None)
         return tomb, op_id
 

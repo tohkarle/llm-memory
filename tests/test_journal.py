@@ -350,7 +350,7 @@ class TestRecovery:
         original_hash = hash_file(target)
 
         with journal:
-            op_id = new_op_id()
+            op_id = journal.reserve_op_id()
             backup = journal.backup(op_id, 0, target)
             target.write_text("partially written new content", encoding="utf-8")
             op = journal.begin(
@@ -372,10 +372,11 @@ class TestRecovery:
                         new_hash="sha256:" + "3" * 64,
                     ),
                 ],
+                op_id=op_id,
             )
             report = journal.recover()
 
-        assert report.rolled_back == [op]
+        assert op == report.rolled_back[0]
         assert target.read_text(encoding="utf-8") == "original content"
         assert hash_file(target) == original_hash
 
@@ -405,6 +406,23 @@ class TestRecovery:
         assert tombstone.exists()
         assert not doomed.exists(), "purge must complete the unlink"
         assert report.unindex == ["mid"]
+
+    def test_sweeps_pre_image_with_no_journal_record(self, journal: Journal, paths: Paths) -> None:
+        """A crash between backup() and begin() leaves an unreferenced pre-image.
+
+        Nothing will ever settle it, so recovery must discard it or the undo
+        area grows without bound.
+        """
+        target = write_memory_file(paths, "orphan.md", "content")
+        with journal:
+            reserved = journal.reserve_op_id()
+            journal.backup(reserved, 0, target)
+            assert (paths.undo_dir / reserved).exists()
+
+            report = journal.recover()
+
+        assert not (paths.undo_dir / reserved).exists()
+        assert any("stale pre-image" in w for w in report.warnings)
 
     def test_is_idempotent(self, journal: Journal, paths: Paths) -> None:
         target = paths.type_dir("fact") / "x.md"
