@@ -66,6 +66,81 @@ EDGE_WEIGHT: dict[str, float] = {
 
 VERBATIM_PREFIX = "fts:"
 
+#: Dropped from multi-word queries. A natural-language question is mostly
+#: function words, and requiring them turns "how do I rebuild the index" into
+#: a query no memory can satisfy.
+STOPWORDS = frozenset(
+    [
+        "a",
+        "an",
+        "and",
+        "any",
+        "are",
+        "as",
+        "at",
+        "be",
+        "been",
+        "by",
+        "can",
+        "did",
+        "do",
+        "does",
+        "for",
+        "from",
+        "had",
+        "has",
+        "have",
+        "how",
+        "i",
+        "if",
+        "in",
+        "into",
+        "is",
+        "it",
+        "its",
+        "me",
+        "my",
+        "no",
+        "not",
+        "of",
+        "on",
+        "or",
+        "our",
+        "should",
+        "so",
+        "than",
+        "that",
+        "the",
+        "their",
+        "them",
+        "then",
+        "there",
+        "these",
+        "they",
+        "this",
+        "to",
+        "was",
+        "we",
+        "were",
+        "what",
+        "when",
+        "where",
+        "which",
+        "who",
+        "why",
+        "will",
+        "with",
+        "would",
+        "you",
+        "your",
+    ]
+)
+
+#: A single term is matched as-is. Beyond that the query is treated as a
+#: bag of words: terms are ORed and ranked, because for recall a memory
+#: ranked low is recoverable and a memory excluded is invisible.
+AND_TERM_LIMIT = 1
+
 _FTS_SPECIALS = re.compile(r'[*"():^{}\[\]~]')
 _TOKEN_SPLIT = re.compile(r"\s+")
 
@@ -184,16 +259,35 @@ def fts_query(raw: str) -> str:
         return verbatim
 
     tokens: list[str] = []
+    explicit_prefix = False
     for token in _TOKEN_SPLIT.split(text):
         prefix = token.endswith("*")
+        explicit_prefix = explicit_prefix or prefix
         cleaned = _FTS_SPECIALS.sub(" ", token).strip()
         if not cleaned:
             continue
-        quoted = '"' + cleaned.replace('"', "") + '"'
-        tokens.append(quoted + "*" if prefix else quoted)
+        tokens.append('"' + cleaned.replace('"', "") + '"' + ("*" if prefix else ""))
+
     if not tokens:
         raise SearchError(f"no searchable terms in {raw!r}")
-    return " AND ".join(tokens)
+
+    # Function words carry no retrieval signal, so they are dropped before
+    # anything else -- otherwise "what timezone" requires "what" to appear.
+    content = [t for t in tokens if t.strip('"*').casefold() not in STOPWORDS]
+    kept = content or tokens
+
+    if len(kept) <= AND_TERM_LIMIT:
+        return " AND ".join(kept)
+
+    # A longer query reads as a question, not a conjunction of required
+    # terms. OR the content words: bm25 ranks documents matching more of
+    # them higher, so precision comes from scoring rather than from
+    # excluding everything that misses one word.
+    if not explicit_prefix:
+        # Trailing-prefix each term so "testing" reaches "tests" without a
+        # stemmer. FTS5 needs >= 3 characters for a prefix query.
+        kept = [t if len(t.strip('"')) < 3 else t + "*" for t in kept]
+    return " OR ".join(kept)
 
 
 def recency_decay(

@@ -87,10 +87,37 @@ class TestFtsQuerySanitation:
         target = seed(api, title="Uses claude-code daily", body="cli tooling")
         assert ids(api.search("claude-code")) == [target.id]
 
-    def test_multiple_tokens_are_anded(self, api: MemoryAPI) -> None:
+    def test_multi_term_queries_rank_rather_than_exclude(self, api: MemoryAPI) -> None:
+        """A missing term must lower a hit's rank, not remove it.
+
+        Requiring every term made natural-language questions unanswerable:
+        "how do I rebuild the index" matched nothing, not even a memory
+        titled "How to rebuild the memory index".
+        """
         both = seed(api, title="python and uv together", body="x")
-        seed(api, title="python only", body="y")
-        assert ids(api.search("python uv")) == [both.id]
+        partial = seed(api, title="python only", body="y")
+        found = ids(api.search("python uv"))
+        assert found[0] == both.id, "matching more terms must rank higher"
+        assert partial.id in found, "a partial match stays reachable"
+
+    def test_stopwords_are_dropped(self, api: MemoryAPI) -> None:
+        """A question is mostly function words; requiring them matches nothing."""
+        target = seed(api, title="How to rebuild the memory index", body="steps")
+        assert target.id in ids(api.search("how do I rebuild the index"))
+
+    def test_prefix_matching_covers_simple_inflections(self, api: MemoryAPI) -> None:
+        """No stemmer, so multi-term queries prefix-match instead."""
+        target = seed(api, title="Runs the test suite often", body="pytest")
+        assert target.id in ids(api.search("running tests suite"))
+
+    def test_single_term_is_matched_exactly(self, api: MemoryAPI) -> None:
+        seed(api, title="Prefers uv", body="x")
+        other = seed(api, title="Unrelated entirely", body="y")
+        assert other.id not in ids(api.search("uv"))
+
+    def test_a_query_of_only_stopwords_still_searches(self, api: MemoryAPI) -> None:
+        seed(api, title="The thing", body="x")
+        assert isinstance(api.search("the"), list)
 
     def test_prefix_search(self, api: MemoryAPI) -> None:
         target = seed(api, title="Python tooling", body="x")

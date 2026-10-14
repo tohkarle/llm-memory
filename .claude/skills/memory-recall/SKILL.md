@@ -44,11 +44,14 @@ Returns `{total, hits[{memory_id, title, type, score, snippet, tags}]}`.
 
 ## What agents get wrong
 
-**Matching is lexical.** "What do I like for packaging" will not find
-"prefers uv over pip" — no shared term. If a search comes back thin, retry
-with the user's own words, or `fts:` with synonyms. Do not conclude nothing
-is recorded from one miss. Profile memories are exempt: they are always in
-`context` regardless of the query.
+**Matching is lexical, not semantic.** Multi-word queries are treated as a
+bag of words — stopwords dropped, terms ORed and prefix-matched, ranked by
+how many hit — so "how do I rebuild the index" does find "How to rebuild the
+memory index". But a query sharing *no* vocabulary with a memory still
+misses: "what timezone" will not find "Works in Pacific time". If a search
+comes back thin, retry with the user's own words, or `fts:` with synonyms.
+Do not conclude nothing is recorded from one miss. Profile memories are
+exempt: they are always in `context` regardless of the query.
 
 **Superseded and deleted memories are hidden by default.** That is deliberate
 — a correction should not resurface beside the thing it replaced. Pass
