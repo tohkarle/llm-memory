@@ -1,0 +1,63 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "personal-ai-memory"
+version = "0.1.0"
+description = "Local-first, filesystem-authoritative memory system for LLM agents"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pyyaml>=6.0",
+    "click>=8.1",
+]
+
+[project.scripts]
+mem = "memory.cli:main"
+
+[project.optional-dependencies]
+mcp = ["mcp>=1.2"]
+tokenizer = ["tiktoken>=0.7"]
+dev = [
+    "pytest>=8",
+    "pytest-cov",
+    "ruff>=0.6",
+    "mypy>=1.11",
+    "hypothesis>=6.100",
+    "types-pyyaml",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/memory"]
+
+# Editable installs add this directory to sys.path via a plainly-named
+# .pth file. Hatchling's default name starts with an underscore, which
+# CPython >= 3.12 skips as "hidden", leaving the package unimportable.
+[tool.hatch.build.targets.wheel.sources]
+"src" = ""
+
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"
+filterwarnings = ["error"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+ignore = ["B008"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src/memory"]
+warn_unreachable = true
+
+[[tool.mypy.overrides]]
+module = "mcp.*"
+ignore_missing_imports = true

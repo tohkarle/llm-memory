@@ -1,0 +1,16 @@
+# data is user state, not source; keep the tree shape only
+data/**
+!data/**/.gitkeep
+
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+.DS_Store
