@@ -100,6 +100,18 @@ def rebuild_index(
             continue
         header.setdefault("id", path.stem)
         header["output_path"] = paths.rel(path)
+        missing = {"kind", "processor", "processor_version", "input_hash", "params_hash"} - set(
+            header
+        )
+        if missing:
+            errors.append(
+                {
+                    "path": paths.rel(path),
+                    "error": f"derivation header missing: {', '.join(sorted(missing))}",
+                }
+            )
+            continue
+        header.setdefault("created_at", _now())
         try:
             db.index_derivation(conn, header)
         except (sqlite3.DatabaseError, KeyError) as exc:
