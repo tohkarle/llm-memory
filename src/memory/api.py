@@ -37,6 +37,15 @@ from .models import (
     now_utc,
 )
 from .paths import Paths, RootNotFound
+from .search import (
+    Hit,
+    RelatedHit,
+    SearchError,
+    SearchFilters,
+    get_related,
+    profile_memories,
+    search,
+)
 from .store import Conflict, NotFound, Store, Tombstoned
 
 #: Fields a caller may patch through ``update``. ``type`` is excluded on
@@ -605,6 +614,30 @@ class MemoryAPI:
             removed_files=removed,
         )
 
+    # ------------------------------------------------------------------ retrieval
+
+    def search(
+        self,
+        query: str | None = None,
+        *,
+        filters: SearchFilters | None = None,
+        **kwargs: Any,
+    ) -> list[Hit]:
+        """Keyword and/or metadata search. See :class:`SearchFilters`."""
+        if filters is not None and kwargs:
+            raise ValueError("pass either filters= or keyword filters, not both")
+        return search(self.conn, query, filters or SearchFilters(**kwargs))
+
+    def get_related(self, mid: str, **kwargs: Any) -> list[RelatedHit]:
+        return get_related(self.conn, mid, **kwargs)
+
+    def profile(self, *, limit: int = 50) -> list[Hit]:
+        """Memories flagged as always-relevant."""
+        return profile_memories(self.conn, limit=limit)
+
+    def review_due(self, *, limit: int = 20) -> list[Hit]:
+        return self.search(filters=SearchFilters(review_due=True, limit=limit, order="updated"))
+
     # ------------------------------------------------------------------ assets
 
     def store_asset(
@@ -1100,11 +1133,14 @@ def _apply_patch(current: Memory, patch: dict[str, Any]) -> Memory:
 __all__ = [
     "Conflict",
     "DeleteResult",
+    "Hit",
     "MemoryAPI",
     "MergeResult",
     "NotFound",
     "Relation",
     "ReplaceResult",
+    "SearchError",
+    "SearchFilters",
     "SourceRef",
     "Tombstoned",
 ]
