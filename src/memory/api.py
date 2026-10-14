@@ -20,16 +20,20 @@ from typing import Any, Self
 from . import db
 from .journal import Journal, RecoveryReport
 from .models import (
+    SENSITIVITY_ORDER,
+    Asset,
     Memory,
     MemoryStatus,
     MemoryType,
     Relation,
+    Segment,
     Sensitivity,
     SourceRef,
     Tombstone,
     clean_entities,
     clean_tags,
     ensure_valid,
+    fmt_ts,
     now_utc,
 )
 from .paths import Paths, RootNotFound
@@ -59,6 +63,39 @@ PATCHABLE = frozenset(
         "extra",
     }
 )
+
+
+@dataclass(slots=True)
+class ReplaceResult:
+    new: Memory
+    superseded: Memory
+    reason: str | None = None
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "new": self.new.to_public(),
+            "superseded": {
+                "id": self.superseded.id,
+                "status": self.superseded.status.value,
+                "superseded_by": self.superseded.superseded_by,
+                "valid_until": fmt_ts(self.superseded.valid_until),
+            },
+            "reason": self.reason,
+        }
+
+
+@dataclass(slots=True)
+class MergeResult:
+    merged: Memory
+    superseded: list[Memory]
+    strategy: str = "union"
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "merged": self.merged.to_public(),
+            "superseded": [p.id for p in self.superseded],
+            "strategy": self.strategy,
+        }
 
 
 @dataclass(slots=True)
@@ -338,6 +375,180 @@ class MemoryAPI:
             self.journal.commit(result.op_id)
         return updated
 
+    # ------------------------------------------------------------------ supersede
+
+    def replace(
+        self,
+        mid: str,
+        *,
+        title: str,
+        body: str = "",
+        type: str | MemoryType | None = None,
+        reason: str | None = None,
+        **fields: Any,
+    ) -> ReplaceResult:
+        """Supersede a memory with a new one, preserving the old version.
+
+        Unlike :meth:`update`, this mints a new id and keeps the old memory on
+        disk with ``status=superseded`` and its full body intact. That is the
+        difference between "I misspelled this" and "this is no longer what I
+        think": the latter is history worth keeping.
+        """
+        self._require_writable()
+        old = self.store.require(mid)
+        if old.status is MemoryStatus.DELETED:
+            raise Conflict(f"memory {mid} is deleted; create a new memory instead")
+
+        carried = _carry_forward(old, fields)
+        new_memory = _build_memory(
+            type=type or old.type,
+            title=title,
+            body=body,
+            fields={**carried, "supersedes": [*old.supersedes, mid]},
+        )
+        stamp = now_utc()
+        superseded = old.with_updates(
+            status=MemoryStatus.SUPERSEDED,
+            superseded_by=new_memory.id,
+            valid_until=old.valid_until or stamp,
+            updated_at=stamp,
+        )
+
+        with self.journal:
+            created = self.store.write_new(new_memory)
+            updated = self.store.overwrite(superseded)
+            try:
+                db.index_memory(
+                    self.conn,
+                    new_memory,
+                    path=self.paths.rel(created.path),
+                    mtime_ns=self.store.stat_mtime_ns(created.path),
+                )
+                self._reindex_one(mid)
+                self.conn.commit()
+            except sqlite3.DatabaseError:
+                self.conn.rollback()
+                db.add_dirty(self.conn, [new_memory.id, mid])
+                self.conn.commit()
+            self.journal.commit(created.op_id)
+            if updated is not None:
+                self.journal.commit(updated.op_id)
+
+        return ReplaceResult(new=new_memory, superseded=superseded, reason=reason)
+
+    def merge(
+        self,
+        ids: list[str],
+        *,
+        into: str | None = None,
+        title: str | None = None,
+        body: str | None = None,
+        strategy: str = "union",
+    ) -> MergeResult:
+        """Consolidate duplicates into one memory.
+
+        By default this mints a new id and leaves every parent intact and
+        marked superseded, so the merge is auditable. ``into`` folds into an
+        existing parent instead, when a stable id matters more than history.
+
+        The union of sources is the part that must not be lost: a merged
+        memory has to cite everything its parents cited, or provenance
+        silently narrows.
+        """
+        self._require_writable()
+        if len(ids) < 2:
+            raise ValueError("merge needs at least two memories")
+        if into is not None and into not in ids:
+            raise ValueError(f"--into {into} must be one of the merged ids")
+        if strategy not in ("union", "prefer-newest", "prefer-highest-confidence"):
+            raise ValueError(f"unknown merge strategy: {strategy}")
+
+        parents = [self.store.require(mid) for mid in dict.fromkeys(ids)]
+        for parent in parents:
+            if parent.status is MemoryStatus.DELETED:
+                raise Conflict(f"memory {parent.id} is deleted and cannot be merged")
+
+        merged_fields = _merge_fields(parents, strategy=strategy)
+        stamp = now_utc()
+
+        if into is not None:
+            target = next(p for p in parents if p.id == into)
+            others = [p for p in parents if p.id != into]
+            merged = target.with_updates(
+                title=title or target.title,
+                body=body if body is not None else merged_fields["body"],
+                updated_at=stamp,
+                supersedes=sorted({*target.supersedes, *(o.id for o in others)}),
+                **{
+                    k: v
+                    for k, v in merged_fields.items()
+                    if k
+                    in (
+                        "tags",
+                        "entities",
+                        "assets",
+                        "sources",
+                        "relations",
+                        "confidence",
+                        "salience",
+                        "occurred_at",
+                        "created_at",
+                    )
+                },
+            )
+        else:
+            merged = _build_memory(
+                type=merged_fields["type"],
+                title=title or parents[0].title,
+                body=body if body is not None else merged_fields["body"],
+                fields={
+                    **{k: v for k, v in merged_fields.items() if k not in ("type", "body")},
+                    "supersedes": sorted({p.id for p in parents}),
+                },
+            )
+            others = parents
+
+        ensure_valid(merged)
+        superseded: list[Memory] = [
+            p.with_updates(
+                status=MemoryStatus.SUPERSEDED,
+                superseded_by=merged.id,
+                valid_until=p.valid_until or stamp,
+                updated_at=stamp,
+            )
+            for p in others
+        ]
+
+        with self.journal:
+            op_ids: list[str] = []
+            if into is not None:
+                written = self.store.overwrite(merged)
+                if written is not None:
+                    op_ids.append(written.op_id)
+            else:
+                created = self.store.write_new(merged)
+                op_ids.append(created.op_id)
+
+            for parent in superseded:
+                result = self.store.overwrite(parent)
+                if result is not None:
+                    op_ids.append(result.op_id)
+
+            try:
+                self._reindex_one(merged.id)
+                for parent in superseded:
+                    self._reindex_one(parent.id)
+                self.conn.commit()
+            except sqlite3.DatabaseError:
+                self.conn.rollback()
+                db.add_dirty(self.conn, [merged.id, *(p.id for p in superseded)])
+                self.conn.commit()
+
+            for op_id in op_ids:
+                self.journal.commit(op_id)
+
+        return MergeResult(merged=merged, superseded=superseded, strategy=strategy)
+
     # ------------------------------------------------------------------ delete
 
     def delete(
@@ -363,6 +574,11 @@ class MemoryAPI:
                     db.index_tombstone(
                         self.conn, tomb, path=self.paths.rel(self.paths.tombstone_file(mid))
                     )
+                    # Drop sources nothing cites any more. The raw files under
+                    # conversations/ and documents/ are untouched -- this is
+                    # only the index row, which a rebuild would not recreate
+                    # because no memory references it.
+                    db.prune_orphan_sources(self.conn)
                     self.conn.commit()
                 except sqlite3.DatabaseError:
                     self.conn.rollback()
@@ -388,6 +604,255 @@ class MemoryAPI:
             tombstone=tomb.to_json(),
             removed_files=removed,
         )
+
+    # ------------------------------------------------------------------ assets
+
+    def store_asset(
+        self,
+        path_or_bytes: Path | str | bytes,
+        *,
+        media_type: str | None = None,
+        filename: str | None = None,
+        tags: list[str] | None = None,
+        source: SourceRef | None = None,
+        meta: dict[str, Any] | None = None,
+        link_to: list[str] | None = None,
+    ) -> Asset:
+        """Import a file into managed storage.
+
+        Identical bytes are stored once, but each import gets its own asset
+        id: the same PDF can be two different things in the user's world, and
+        collapsing them would conflate those.
+        """
+        self._require_writable()
+        src = Path(path_or_bytes) if isinstance(path_or_bytes, str | Path) else path_or_bytes
+
+        with self.journal:
+            blob = self.store.put_blob(src)
+            asset = Asset(
+                sha256=blob.sha256,
+                media_type=(
+                    media_type
+                    or (self.store.guess_media_type(src) if isinstance(src, Path) else None)
+                    or "application/octet-stream"
+                ),
+                bytes=blob.bytes,
+                original_filename=filename or (src.name if isinstance(src, Path) else None),
+                tags=clean_tags(tags or []),
+                meta=dict(meta or {}),
+                source=source,
+            )
+            meta_path = self.store.write_asset_meta(asset)
+            db.index_asset(
+                self.conn,
+                asset,
+                blob_path=self.paths.rel(blob.path),
+                meta_path=self.paths.rel(meta_path),
+            )
+            for mid in link_to or []:
+                memory = self.store.require(mid)
+                if asset.id not in memory.assets:
+                    updated = memory.with_updates(
+                        assets=[*memory.assets, asset.id], updated_at=now_utc()
+                    )
+                    result = self.store.overwrite(updated)
+                    self._reindex_one(mid)
+                    if result is not None:
+                        self.journal.commit(result.op_id)
+            self.conn.commit()
+        return asset
+
+    def get_asset(self, asset_id: str, *, with_derived: bool = False) -> dict[str, Any] | None:
+        asset = self.store.read_asset_meta(asset_id)
+        if asset is None:
+            return None
+        payload = asset.to_json()
+        payload["blob_path"] = self.paths.rel(self.paths.asset_blob(asset.sha256))
+        payload["exists"] = self.paths.asset_blob(asset.sha256).exists()
+        if with_derived:
+            payload["derivations"] = [
+                dict(row)
+                for row in self.conn.execute(
+                    "SELECT id, kind, processor, processor_version, status, output_path "
+                    "FROM derivations WHERE asset_id = ? ORDER BY kind, created_at",
+                    (asset_id,),
+                )
+            ]
+        return payload
+
+    def replace_asset(
+        self,
+        asset_id: str,
+        path_or_bytes: Path | str | bytes,
+        *,
+        discard_previous: bool = False,
+        media_type: str | None = None,
+    ) -> Asset:
+        """Point an existing asset at new bytes, keeping its id.
+
+        The id identifies the thing, not the bytes, so every memory that
+        references it keeps working. The prior blob is retained by default --
+        cheap version history is the point of content addressing.
+        """
+        self._require_writable()
+        existing = self.store.require_asset(asset_id)
+        src = Path(path_or_bytes) if isinstance(path_or_bytes, str | Path) else path_or_bytes
+
+        with self.journal:
+            blob = self.store.put_blob(src)
+            updated = Asset(
+                id=existing.id,
+                sha256=blob.sha256,
+                media_type=media_type or existing.media_type,
+                bytes=blob.bytes,
+                original_filename=(
+                    src.name if isinstance(src, Path) else existing.original_filename
+                ),
+                created_at=existing.created_at,
+                tags=existing.tags,
+                meta=existing.meta,
+                source=existing.source,
+                prev_sha256=None if discard_previous else existing.sha256,
+                version=existing.version + 1,
+            )
+            meta_path = self.store.write_asset_meta(updated)
+            db.index_asset(
+                self.conn,
+                updated,
+                blob_path=self.paths.rel(blob.path),
+                meta_path=self.paths.rel(meta_path),
+            )
+            self.conn.commit()
+            if (
+                discard_previous
+                and existing.sha256 != blob.sha256
+                and self.store.blob_refcount(existing.sha256) == 0
+            ):
+                self.store.unlink_blob(existing.sha256)
+        return updated
+
+    def delete_asset(
+        self, asset_id: str, *, permanent: bool = False, gc_blobs: bool = False
+    ) -> dict[str, Any]:
+        """Mark an asset deleted, or remove its metadata entirely.
+
+        Blobs survive unless ``gc_blobs`` is set and nothing else references
+        them, since the same bytes may back another asset or an older version.
+        """
+        self._require_writable()
+        asset = self.store.require_asset(asset_id)
+        removed_blobs: list[str] = []
+
+        with self.journal:
+            if permanent:
+                self.store.delete_asset_meta(asset_id)
+                db.unindex_asset(self.conn, asset_id)
+            else:
+                marked = Asset(
+                    id=asset.id,
+                    sha256=asset.sha256,
+                    media_type=asset.media_type,
+                    bytes=asset.bytes,
+                    original_filename=asset.original_filename,
+                    created_at=asset.created_at,
+                    imported_at=asset.imported_at,
+                    status="deleted",
+                    tags=asset.tags,
+                    meta=asset.meta,
+                    source=asset.source,
+                    prev_sha256=asset.prev_sha256,
+                    version=asset.version,
+                )
+                meta_path = self.store.write_asset_meta(marked)
+                db.index_asset(
+                    self.conn,
+                    marked,
+                    blob_path=self.paths.rel(self.paths.asset_blob(marked.sha256)),
+                    meta_path=self.paths.rel(meta_path),
+                )
+            self.conn.commit()
+
+            if gc_blobs:
+                for digest in filter(None, (asset.sha256, asset.prev_sha256)):
+                    if self.store.blob_refcount(digest) == 0 and self.store.unlink_blob(digest):
+                        removed_blobs.append(digest)
+
+        return {
+            "asset_id": asset_id,
+            "permanent": permanent,
+            "removed_blobs": removed_blobs,
+        }
+
+    def register_derivation(
+        self,
+        *,
+        asset_id: str,
+        kind: str,
+        processor: str,
+        processor_version: str,
+        output_path: Path,
+        params_hash: str = "default",
+        segments: list[dict[str, Any]] | None = None,
+        status: str = "complete",
+        cost_ms: int | None = None,
+    ) -> dict[str, Any]:
+        """Index a derived output a processor has already written.
+
+        The output file must embed its own cache key (a ``_derivation`` key in
+        JSON, YAML frontmatter in Markdown), because that header is what lets
+        ``rebuild_index`` reconstruct these rows from the filesystem alone.
+        This method and the rebuild path therefore agree by construction.
+        """
+        self._require_writable()
+        from .lifecycle import read_derivation_header
+
+        asset = self.store.require_asset(asset_id)
+        derivation_id = output_path.stem
+
+        # The sidecar header in the output file is authoritative: it is what a
+        # rebuild will read, so taking the row from it keeps the live path and
+        # the rebuild path in exact agreement.
+        header = read_derivation_header(output_path) or {}
+        row: dict[str, Any] = {
+            "id": str(header.get("id") or derivation_id),
+            "asset_id": asset.id,
+            "source_id": header.get("source_id"),
+            "kind": str(header.get("kind") or kind),
+            "processor": str(header.get("processor") or processor),
+            "processor_version": str(header.get("processor_version") or processor_version),
+            "input_hash": str(header.get("input_hash") or asset.sha256),
+            "params_hash": str(header.get("params_hash") or params_hash),
+            "output_path": self.paths.rel(output_path),
+            "output_hash": header.get("output_hash"),
+            "status": str(header.get("status") or status),
+            "error": header.get("error"),
+            "created_at": str(header.get("created_at") or fmt_ts(now_utc())),
+            # Absent in the header means absent, full stop. Inventing a value
+            # here would be a field the rebuild cannot reproduce.
+            "completed_at": header.get("completed_at"),
+            "cost_ms": header.get("cost_ms", cost_ms),
+        }
+        with self.journal:
+            db.index_derivation(self.conn, row)
+            for i, raw in enumerate(segments or []):
+                db.index_segment(
+                    self.conn,
+                    Segment(
+                        id=str(raw.get("id") or f"{row['id']}:{i}"),
+                        text=str(raw["text"]),
+                        ordinal=int(raw.get("ordinal", i)),
+                        asset_id=asset.id,
+                        derivation_id=str(row["id"]),
+                        start_ms=raw.get("start_ms"),
+                        end_ms=raw.get("end_ms"),
+                        page=raw.get("page"),
+                        bbox=raw.get("bbox"),
+                        speaker=raw.get("speaker"),
+                        meta=dict(raw.get("meta") or {}),
+                    ),
+                )
+            self.conn.commit()
+        return row
 
     # ------------------------------------------------------------------ maintenance
 
@@ -513,6 +978,109 @@ def _build_memory(
     return ensure_valid(Memory(**kwargs))
 
 
+#: Fields a replacement inherits from the memory it supersedes unless the
+#: caller overrides them. Deliberately excludes status/supersedes/id and the
+#: timestamps, which the supersession itself sets.
+CARRIED = (
+    "tags",
+    "entities",
+    "assets",
+    "sources",
+    "relations",
+    "confidence",
+    "salience",
+    "profile",
+    "sensitivity",
+    "occurred_at",
+    "valid_from",
+    "review_after",
+    "extra",
+)
+
+
+def _carry_forward(old: Memory, overrides: dict[str, Any]) -> dict[str, Any]:
+    """Inherit context from the superseded memory.
+
+    A replacement that silently dropped the old memory's sources or tags
+    would quietly destroy provenance, so inheritance is the default and the
+    caller opts out per field.
+    """
+    carried: dict[str, Any] = {}
+    for key in CARRIED:
+        carried[key] = overrides.pop(key, getattr(old, key))
+    carried.update(overrides)
+    return carried
+
+
+def _merge_fields(parents: list[Memory], *, strategy: str) -> dict[str, Any]:
+    """Combine parents into one field set.
+
+    Sources, tags, entities, assets and relations are always unioned -- the
+    merged memory must cite everything its parents cited. ``strategy`` only
+    decides which parent's *type* and body ordering lead.
+    """
+    # Timestamps are second-precision, so two memories written in the same
+    # second would otherwise order arbitrarily. Falling back to the caller's
+    # argument order keeps a merge reproducible.
+    position = {m.id: i for i, m in enumerate(parents)}
+    if strategy == "prefer-newest":
+        ordered = sorted(parents, key=lambda m: (m.updated_at, -position[m.id]), reverse=True)
+    elif strategy == "prefer-highest-confidence":
+        ordered = sorted(
+            parents,
+            key=lambda m: (m.confidence, m.updated_at, -position[m.id]),
+            reverse=True,
+        )
+    else:
+        ordered = list(parents)
+    lead = ordered[0]
+
+    sources: list[SourceRef] = []
+    seen_sources: set[tuple[str, str, str]] = set()
+    for parent in ordered:
+        for src in parent.sources:
+            if src.key() not in seen_sources:
+                seen_sources.add(src.key())
+                sources.append(src)
+
+    relations: list[Relation] = []
+    seen_relations: set[tuple[str, str]] = set()
+    merged_ids = {p.id for p in parents}
+    for parent in ordered:
+        for rel in parent.relations:
+            # A relation pointing at another parent becomes self-referential
+            # once they collapse into one memory.
+            if rel.target in merged_ids:
+                continue
+            key = (rel.type.value, rel.target)
+            if key not in seen_relations:
+                seen_relations.add(key)
+                relations.append(rel)
+
+    occurred = [p.occurred_at for p in parents if p.occurred_at is not None]
+    body = "\n\n".join(
+        f"## from {p.title} ({p.id[:8]})\n\n{p.body}".rstrip() for p in ordered if p.body.strip()
+    )
+
+    return {
+        "type": lead.type,
+        "body": body,
+        "tags": clean_tags([t for p in ordered for t in p.tags]),
+        "entities": clean_entities([e for p in ordered for e in p.entities]),
+        "assets": list(dict.fromkeys(a for p in ordered for a in p.assets)),
+        "sources": sources,
+        "relations": relations,
+        "confidence": max(p.confidence for p in parents),
+        "salience": max(p.salience for p in parents),
+        "profile": any(p.profile for p in parents),
+        "sensitivity": max(
+            (p.sensitivity for p in parents), key=lambda s: SENSITIVITY_ORDER[s.value]
+        ),
+        "created_at": min(p.created_at for p in parents),
+        "occurred_at": min(occurred) if occurred else None,
+    }
+
+
 def _apply_patch(current: Memory, patch: dict[str, Any]) -> Memory:
     changes: dict[str, Any] = {}
     for key, value in patch.items():
@@ -533,8 +1101,10 @@ __all__ = [
     "Conflict",
     "DeleteResult",
     "MemoryAPI",
+    "MergeResult",
     "NotFound",
     "Relation",
+    "ReplaceResult",
     "SourceRef",
     "Tombstoned",
 ]

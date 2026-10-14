@@ -95,7 +95,7 @@ def rebuild_index(
     # file carries. Without that header these rows would be index-only state
     # and `rm memory.sqlite` would silently lose the processor cache.
     for path in paths.derived_glob():
-        header = _read_derivation_header(path)
+        header = read_derivation_header(path)
         if header is None:
             continue
         header.setdefault("id", path.stem)
@@ -123,7 +123,7 @@ def rebuild_index(
     return report
 
 
-def _read_derivation_header(path: Path) -> dict[str, Any] | None:
+def read_derivation_header(path: Path) -> dict[str, Any] | None:
     """Extract the embedded cache key from a derived output file.
 
     JSON outputs carry a ``_derivation`` key; Markdown outputs carry YAML

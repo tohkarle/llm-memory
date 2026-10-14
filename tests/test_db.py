@@ -348,14 +348,46 @@ class TestUnindex:
 
         db.unindex_memory(conn, doomed.id)
 
-        outgoing = conn.execute(
-            "SELECT count(*) c FROM relations WHERE src_id=?", (doomed.id,)
+        # The purged memory's own declarations go.
+        declared = conn.execute(
+            "SELECT count(*) c FROM relations WHERE src_id=? AND implied=0", (doomed.id,)
         ).fetchone()["c"]
+        assert declared == 0
+
+        # The survivor's declaration about it stays, reported as dangling by
+        # verify rather than silently rewritten.
         incoming = conn.execute(
             "SELECT count(*) c FROM relations WHERE dst_id=? AND implied=0", (doomed.id,)
         ).fetchone()["c"]
-        assert outgoing == 0
         assert incoming == 1, "the survivor's own edge must remain"
+
+        # And so does that edge's mirror, which is derived from it: the
+        # survivor owns both, so only the survivor's reindex may remove them.
+        mirror = conn.execute(
+            "SELECT count(*) c FROM relations WHERE src_id=? AND implied=1", (doomed.id,)
+        ).fetchone()["c"]
+        assert mirror == 1
+
+    def test_implied_edges_are_owned_by_the_declaring_memory(
+        self, conn: sqlite3.Connection
+    ) -> None:
+        """Reindexing one memory must not drop an edge another memory owns.
+
+        Regression: a broad delete cleared implied edges whose src_id matched,
+        including ones created by a different memory's frontmatter. Only that
+        memory's own reindex would restore them, so the table depended on
+        write order and diverged from a rebuild.
+        """
+        a = add(conn, make_memory(title="A"))
+        b = add(conn, make_memory(title="B"))
+        # B declares an edge to A, creating the mirror A -> B (implied).
+        add(conn, b.with_updates(relations=[Relation(type=RelationType.CAUSES, target=a.id)]))
+        mirror_sql = "SELECT count(*) c FROM relations WHERE src_id=? AND dst_id=? AND implied=1"
+        assert conn.execute(mirror_sql, (a.id, b.id)).fetchone()["c"] == 1
+
+        # Reindexing A (which declares nothing) must leave B's mirror alone.
+        add(conn, a.with_updates(body="unrelated change"))
+        assert conn.execute(mirror_sql, (a.id, b.id)).fetchone()["c"] == 1
 
     def test_is_safe_on_missing_id(self, conn: sqlite3.Connection) -> None:
         db.unindex_memory(conn, new_id())

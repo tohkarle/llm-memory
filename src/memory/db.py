@@ -574,8 +574,14 @@ def _reindex_children(conn: sqlite3.Connection, m: Memory) -> None:
             (m.id, src.source_id, src.locator or "", src.confidence),
         )
 
+    # Each memory owns exactly the edges its own frontmatter declares: the
+    # forward edge, and the inverse edge pointing back at itself. Clearing
+    # anything else would delete an edge another memory owns and only that
+    # memory's reindex would restore it, making the table depend on write
+    # order -- and diverge from a rebuild.
     conn.execute(
-        "DELETE FROM relations WHERE src_id = ? OR (dst_id = ? AND implied = 1)", (m.id, m.id)
+        "DELETE FROM relations WHERE (src_id = ? AND implied = 0) OR (dst_id = ? AND implied = 1)",
+        (m.id, m.id),
     )
     edges: list[tuple[str, str, str, str | None, int]] = []
     for rel in m.relations:
@@ -610,7 +616,7 @@ def unindex_memory(conn: sqlite3.Connection, mid: str) -> None:
         )
     # Edges *from* this memory go; edges *to* it are left dangling on purpose
     # and reported by verify, so a purge does not silently rewrite history.
-    conn.execute("DELETE FROM relations WHERE src_id = ?", (mid,))
+    conn.execute("DELETE FROM relations WHERE src_id = ? AND implied = 0", (mid,))
     conn.execute("DELETE FROM relations WHERE dst_id = ? AND implied = 1", (mid,))
     conn.execute("DELETE FROM memories WHERE id = ?", (mid,))
 
@@ -646,6 +652,17 @@ def upsert_source(conn: sqlite3.Connection, src: SourceRef, *, retained: bool = 
         },
     )
     return src.source_id
+
+
+def prune_orphan_sources(conn: sqlite3.Connection) -> int:
+    """Remove source rows no memory or asset references.
+
+    Keeps the index reconstructible: a rebuild derives ``sources`` from what
+    memories and assets cite, so a row nothing cites could never come back.
+    The underlying files are never touched.
+    """
+    cur = conn.execute("DELETE FROM sources WHERE id NOT IN (SELECT source_id FROM memory_sources)")
+    return cur.rowcount or 0
 
 
 def index_asset(conn: sqlite3.Connection, a: Asset, *, blob_path: str, meta_path: str) -> None:
