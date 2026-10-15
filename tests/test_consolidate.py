@@ -157,6 +157,164 @@ def test_polarity_conflict_ignores_pairs_negated_on_both_sides(api: MemoryAPI) -
     assert polarity_conflict(a, b) is None
 
 
+# ------------------------------------------------------- similarity precision
+
+#: Pairs that must never be folded together. Every other similarity test here
+#: measures *recall* -- that a known duplicate is found -- which is why a
+#: tokenizer that discarded `5s`, `v1` and `2` could score contradictory
+#: memories at 1.000 through a green suite. These measure precision: each
+#: pair shares nearly all its vocabulary and still asserts different things,
+#: so a detector that calls them duplicates is silently destroying a
+#: distinction the reader depends on.
+NON_DUPLICATE_PAIRS: tuple[tuple[str, tuple[str, str], tuple[str, str]], ...] = (
+    (
+        "unit suffixes",
+        ("Retry delay is 5s", "The retry delay is 5s."),
+        ("Retry delay is 5m", "The retry delay is 5m."),
+    ),
+    (
+        "version pins",
+        ("Pin the client to v1", "Pin the client to v1."),
+        ("Pin the client to v2", "Pin the client to v2."),
+    ),
+    (
+        "bare counts",
+        ("Set retries to 2", "Set retries to 2."),
+        ("Set retries to 10", "Set retries to 10."),
+    ),
+    (
+        "digit-count asymmetry",
+        ("Timeout is 30 seconds", "The timeout is 30 seconds."),
+        ("Timeout is 300 seconds", "The timeout is 300 seconds."),
+    ),
+    (
+        "port numbers",
+        ("Postgres listens on port 5432", "Connect to port 5432."),
+        ("Postgres listens on port 5433", "Connect to port 5433."),
+    ),
+    (
+        "different subjects, same predicate",
+        ("Alice prefers vim", "Alice edits everything in vim."),
+        ("Bob prefers vim", "Bob edits everything in vim."),
+    ),
+    (
+        "unmarked antonyms",
+        ("Enable the cache", "The cache should be enabled."),
+        ("Disable the cache", "The cache should be disabled."),
+    ),
+)
+
+
+@pytest.mark.parametrize(
+    ("case", "left", "right"),
+    NON_DUPLICATE_PAIRS,
+    ids=[case for case, _, _ in NON_DUPLICATE_PAIRS],
+)
+def test_near_identical_but_contradictory_pairs_are_not_duplicates(
+    api: MemoryAPI, case: str, left: tuple[str, str], right: tuple[str, str]
+) -> None:
+    """`--apply` merges `duplicate` by default, so this is the auto-merge gate."""
+    seed(api, title=left[0], body=left[1])
+    seed(api, title=right[0], body=right[1])
+    report = detect(api)
+    assert [p for p in report.proposals if p.kind == "duplicate"] == [], case
+
+
+@pytest.mark.parametrize(
+    ("case", "left", "right"),
+    NON_DUPLICATE_PAIRS,
+    ids=[case for case, _, _ in NON_DUPLICATE_PAIRS],
+)
+def test_near_identical_but_contradictory_pairs_score_below_the_duplicate_cut(
+    api: MemoryAPI, case: str, left: tuple[str, str], right: tuple[str, str]
+) -> None:
+    a = seed(api, title=left[0], body=left[1])
+    b = seed(api, title=right[0], body=right[1])
+    score, _ = similarity(a, b)
+    assert score < DUPLICATE_THRESHOLD, f"{case}: scored {score}"
+
+
+def test_tokens_keeps_digit_bearing_tokens() -> None:
+    """`5s`, `v2` and `10` are the whole difference between two memories."""
+    assert tokens("retry delay 5s") == {"retry", "delay", "5s"}
+    assert tokens("pin to v1") == {"pin", "v1"}
+    assert tokens("set retries to 10") == {"set", "retries", "10"}
+
+
+#: Pairs where retaining digit-bearing tokens is *not* enough on its own:
+#: `containment` is asymmetric, so one side carrying an extra number still
+#: reads as "wholly contained". Without the veto each of these scores above
+#: `DUPLICATE_THRESHOLD` and auto-merges -- see the regression test below,
+#: which asserts exactly that counterfactual.
+VETO_REQUIRED_PAIRS: tuple[tuple[str, tuple[str, str], tuple[str, str]], ...] = (
+    (
+        "containment asymmetry",
+        (
+            "Upstream request timeout is 30 seconds",
+            "The upstream request timeout is set to 30 seconds for every call.",
+        ),
+        (
+            "Upstream request timeout is 300 seconds",
+            "The upstream request timeout is set to 300 seconds for every call and retries.",
+        ),
+    ),
+    (
+        "long shared phrasing",
+        (
+            "Pin the vendored client library to v1",
+            "Pin the vendored client library to v1 in the lockfile.",
+        ),
+        (
+            "Pin the vendored client library to v2",
+            "Pin the vendored client library to v2 in the lockfile.",
+        ),
+    ),
+)
+
+
+@pytest.mark.parametrize(
+    ("case", "left", "right"),
+    VETO_REQUIRED_PAIRS,
+    ids=[case for case, _, _ in VETO_REQUIRED_PAIRS],
+)
+def test_the_numeric_veto_is_what_keeps_these_pairs_apart(
+    api: MemoryAPI,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+    left: tuple[str, str],
+    right: tuple[str, str],
+) -> None:
+    """Proves the veto is load-bearing, not belt-and-braces.
+
+    Keeping `300` and `v2` as tokens is necessary but insufficient here: with
+    the veto disabled these score well above the duplicate cut, so a fix that
+    only touched the tokenizer would still auto-merge them.
+    """
+    a = seed(api, title=left[0], body=left[1])
+    b = seed(api, title=right[0], body=right[1])
+
+    monkeypatch.setattr(consolidate, "numeric_conflict", lambda *_: False)
+    without_veto, _ = similarity(a, b)
+    monkeypatch.undo()
+    with_veto, evidence = similarity(a, b)
+
+    assert without_veto >= DUPLICATE_THRESHOLD, f"{case}: the veto has nothing to do"
+    assert with_veto < DUPLICATE_THRESHOLD, f"{case}: scored {with_veto}"
+    assert evidence["numeric_conflict"] is True
+    assert with_veto >= NEAR_THRESHOLD, "the pair must stay visible, not vanish"
+
+
+def test_numeric_disagreement_does_not_block_a_genuine_paraphrase(
+    api: MemoryAPI,
+) -> None:
+    """The veto needs *both* sides numeric and disagreeing, or it would mute
+    the short-inside-long case containment exists to catch."""
+    a = seed(api, title="Deploys from the v2 branch", body="Releases cut from v2.")
+    b = seed(api, title="Deploys from the v2 branch", body="Releases are cut from v2.")
+    score, _ = similarity(a, b)
+    assert score >= DUPLICATE_THRESHOLD, score
+
+
 # ---------------------------------------------------------------- detection
 
 

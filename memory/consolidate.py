@@ -72,6 +72,11 @@ DUPLICATE_THRESHOLD = 0.72
 #: and left for a human: close enough to notice, not close enough to fold.
 NEAR_THRESHOLD = 0.45
 
+#: Ceiling applied when two memories quantify the same thing differently
+#: ("5s" vs "5m"). Below :data:`DUPLICATE_THRESHOLD` so the pair can never
+#: auto-merge, and inside the near-duplicate band so it is still reported.
+NUMERIC_CONFLICT_CAP = 0.70
+
 #: Identical normalized content. Not a judgement call -- the same memory was
 #: written twice, so the proposal is high-confidence regardless of weights.
 EXACT_SCORE = 1.0
@@ -82,7 +87,10 @@ EXACT_SCORE = 1.0
 CANDIDATES_PER_MEMORY = 25
 
 #: Tokens shorter than this carry no discriminating signal and inflate
-#: overlap between unrelated memories.
+#: overlap between unrelated memories -- *unless* they contain a digit, which
+#: is exempt below: `5s`, `v1` and `2` are short precisely because they are
+#: the only difference between two memories, and dropping them left
+#: "retry delay 5s" and "retry delay 5m" with identical token sets.
 MIN_TOKEN_LEN = 3
 
 _TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_-]*")
@@ -208,8 +216,34 @@ def tokens(text: str) -> set[str]:
     return {
         token
         for token in _TOKEN_RE.findall(fold_diacritics(normalize_text(text)))
-        if len(token) >= MIN_TOKEN_LEN and token not in STOPWORDS
+        if (len(token) >= MIN_TOKEN_LEN or any(c.isdigit() for c in token))
+        and token not in STOPWORDS
     }
+
+
+def numeric_tokens(values: set[str]) -> set[str]:
+    """The digit-bearing tokens in a token set: versions, counts, durations."""
+    return {token for token in values if any(c.isdigit() for c in token)}
+
+
+def numeric_conflict(left: set[str], right: set[str]) -> bool:
+    """True when both sides quantify something and disagree about the number.
+
+    Keeping digit-bearing tokens is necessary but not sufficient, because
+    :func:`containment` is asymmetric: "timeout 30 seconds" vs "timeout 300
+    seconds" still scores 1.000, since one side's tokens are wholly contained
+    in the other's and the extra number reads as mere elaboration. A number
+    is not elaboration -- it is the claim -- so a disagreement here vetoes
+    the duplicate call and leaves the pair advisory.
+
+    Both sides must be numeric and their numbers must not overlap at all: a
+    one-line memory and a paragraph that cite the same version are still the
+    paraphrase this detector exists to find.
+    """
+    a, b = numeric_tokens(left), numeric_tokens(right)
+    if not a or not b:
+        return False
+    return not (a & b)
 
 
 def jaccard(left: set[str], right: set[str]) -> float:
@@ -278,8 +312,20 @@ def similarity(a: Memory, b: Memory) -> tuple[float, dict[str, Any]]:
 
     weight = sum(WEIGHTS[name] for name in present)
     score = sum(WEIGHTS[name] * components[name] for name in present) / weight
+    score = min(score, 1.0)
 
-    return min(score, 1.0), components
+    # Numeric precision veto. Two memories that agree on every word and
+    # disagree on a number are not the same memory, and `--apply` merges
+    # `duplicate` proposals by default -- concatenating two bodies that
+    # assert 5s and 5m, and collapsing two titles into one. Cap the pair just
+    # below the duplicate cut so it still surfaces for a human to judge.
+    if numeric_conflict(a_body | a_title, b_body | b_title):
+        capped = min(score, NUMERIC_CONFLICT_CAP)
+        if capped < score:
+            components["numeric_conflict"] = True
+            score = capped
+
+    return score, components
 
 
 def polarity_conflict(a: Memory, b: Memory) -> dict[str, Any] | None:
@@ -876,6 +922,7 @@ __all__ = [
     "DUPLICATE_THRESHOLD",
     "EXACT_SCORE",
     "NEAR_THRESHOLD",
+    "NUMERIC_CONFLICT_CAP",
     "WEIGHTS",
     "ConsolidationReport",
     "Proposal",
@@ -886,6 +933,8 @@ __all__ = [
     "detect",
     "fold_diacritics",
     "jaccard",
+    "numeric_conflict",
+    "numeric_tokens",
     "polarity_conflict",
     "similarity",
     "tokens",
