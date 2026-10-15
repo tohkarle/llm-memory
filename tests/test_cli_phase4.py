@@ -516,3 +516,25 @@ def test_every_new_command_appears_in_help(runner: CliRunner) -> None:
     output = runner.invoke(main, ["--help"]).output
     for name in ("consolidate", "extract", "provider", "source", "backup", "import"):
         assert name in output, name
+
+
+def test_extract_file_accepts_a_root_relative_path(runner: CliRunner, root: Path) -> None:
+    """`--file conversations/x.md` pairs with `--source conversation:conversations/x.md`.
+
+    Click's exists= only resolves against the process cwd, so that natural
+    pairing failed with a bare "does not exist" from the wrong directory.
+    """
+    ref = conversation(root)
+    code, payload = run(runner, root, "extract", "--file", ref, "--source", f"conversation:{ref}")
+    assert code == 0, payload
+    assert payload["data"]["total"] >= 1
+
+
+def test_extract_missing_file_is_a_classified_error(runner: CliRunner, root: Path) -> None:
+    code, payload = run(
+        runner, root, "extract", "--file", "nope.md", "--source", "conversation:x.md"
+    )
+    assert code == 1
+    assert payload["error"]["code"] == "not_found"
+    # The message must say where it looked, or the user cannot act on it.
+    assert "looked in" in payload["error"]["message"]

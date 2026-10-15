@@ -39,6 +39,67 @@ the project you can always use `uv run python -m memory …` instead. Note that
 a later `uv sync` reverts to editable mode and undoes this; re-run
 `uv pip install .` if `mem` stops resolving.
 
+## Memory maintenance
+
+A corpus that only grows accumulates duplicates, contradictions and claims
+that have quietly gone stale. These commands find them; you decide.
+
+```bash
+mem consolidate                       # duplicates, contradictions, stale — reports only
+mem consolidate --apply --yes         # execute the duplicate merges
+mem extract --file notes.md --source document:notes.md
+mem source plan-delete conversations/2026-10-15.md
+mem backup create --label "before cleanup"
+```
+
+`consolidate` and `extract` **write nothing by default**. Each proposal names
+the verb to run and its arguments, so you can apply them selectively or hand
+the JSON to an agent. Duplicate detection is lexical — FTS5 plus token
+overlap, no embeddings and no model needed.
+
+Deleting source material is dependency-aware: `mem source delete` removes the
+transcripts, segments, derivations and assets computed from it. Memories that
+cited it are kept by default, tagged `provenance-lost` and flagged for
+review, because a memory that outlived its citation may still be true.
+`--memories purge` removes them permanently instead, writing tombstones so
+they cannot be re-extracted.
+
+### Backup and retention
+
+```bash
+mem backup create                     # tar of data/, excluding the index
+mem backup list
+mem backup restore <archive> --to /path/to/new-root
+mem backup prune --keep-days 90 --keep-count 10 --yes
+mem export --out memories.jsonl  &&  mem import memories.jsonl
+```
+
+Archives exclude `data/index/` (it is rebuildable) and always include
+tombstones. `restore` extracts and rebuilds in one step, and refuses a
+non-empty root — merging into a live tree is `mem import`, which is additive
+and cannot resurrect a permanently deleted memory. `prune` never removes the
+newest backup, whatever the policy says.
+
+### Optional LLM provider
+
+Every feature above runs without a language model. Configuring one adds
+judgement on the cases a lexical pass cannot settle — paraphrases that are
+not word-for-word duplicates, and extraction from free-form text.
+
+```bash
+mem provider show                     # reports whether one is configured
+mem provider set --provider openai-compatible \
+  --base-url http://localhost:11434/v1 --model qwen2.5
+mem consolidate --llm
+```
+
+**No vendor is hardcoded and nothing is called by default.** The HTTP
+provider speaks the chat-completions format that local runtimes (Ollama,
+llama.cpp, vLLM, LM Studio) expose, and it refuses to construct without an
+explicit `--base-url`, so no request can go anywhere you did not name.
+Settings live in `data/config/llm.json` or `$MEMORY_LLM_*`. Without a
+provider, `--llm` degrades to the deterministic path rather than failing.
+
 ## How agents use it
 
 Two skills in `.claude/skills/` teach any agent the system:
@@ -65,6 +126,10 @@ permanent deletion requires `confirm: true`.
 | Durability | Operation journal + atomic writes; recovers from interrupted writes |
 | Identity | UUID per memory, SHA-256 content addressing for media |
 | Deletion | Soft (superseded) and permanent are separate; tombstones prevent resurrection |
+| Dependencies | Deleting a source removes what was derived from it |
+| Consolidation | Lexical duplicate/conflict detection; proposes, never writes |
+| Intelligence | Optional, pluggable LLM provider; every feature works without one |
+| Backup | tar of `data/` minus the index; explicit retention, lossless round trip |
 
 Memory types: `fact`, `preference`, `event`, `decision`, `procedure`.
 
@@ -77,6 +142,8 @@ data/derived/                    transcripts, descriptions, keyframes
 data/index/memory.sqlite         rebuildable index
 data/.journal/                   operation journal
 data/.tombstones/                deletion records
+data/config/llm.json             optional LLM provider settings
+backups/                         archives, beside data/ not inside it
 ```
 
 Set `$MEMORY_ROOT` or pass `--root` to use a data directory elsewhere.

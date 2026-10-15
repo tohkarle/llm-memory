@@ -1574,7 +1574,12 @@ def consolidate(
 
 
 @main.command()
-@click.option("--file", "path", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option(
+    "--file",
+    "path",
+    type=click.Path(dir_okay=False, path_type=Path),
+    help="Path to the material. Resolved against the cwd, then the memory root.",
+)
 @click.option("--text")
 @click.option("--stdin", "use_stdin", is_flag=True)
 @click.option(
@@ -1618,13 +1623,13 @@ def extract(
                 "pass exactly one of --file, --text, --stdin",
                 EXIT_VALIDATION,
             )
-        material = (
-            path.read_text(encoding="utf-8")
-            if path is not None
-            else (text if text is not None else sys.stdin.read())
-        )
         api = open_api(ctx, read_only=not do_commit)
         try:
+            material = (
+                _read_material(path, api)
+                if path is not None
+                else (text if text is not None else sys.stdin.read())
+            )
             report = api.extract(
                 material or "",
                 source=parse_source(source_spec),
@@ -1643,6 +1648,27 @@ def extract(
             api.close()
 
     run("extract", action)
+
+
+def _read_material(path: Path, api: MemoryAPI) -> str:
+    """Read extraction input, accepting a cwd- or root-relative path.
+
+    A user pairs `--file conversations/x.md` with `--source
+    conversation:conversations/x.md` and means the same file both times. Click's
+    `exists=True` only ever resolves against the process cwd, so that pairing
+    failed with a bare "does not exist" from somewhere other than the root.
+    """
+    if path.is_file():
+        return path.read_text(encoding="utf-8")
+    for candidate in (api.paths.data / path, api.paths.root / path):
+        if candidate.is_file():
+            return candidate.read_text(encoding="utf-8")
+    raise CliError(
+        "not_found",
+        f"no such file: {path} (looked in the current directory, "
+        f"in {api.paths.data} and in {api.paths.root})",
+        EXIT_NOT_FOUND,
+    )
 
 
 # ---------------------------------------------------------------- sources

@@ -42,6 +42,28 @@ mem get <id> --related --follow                   # full text + neighbours
 
 Returns `{total, hits[{memory_id, title, type, score, snippet, tags}]}`.
 
+## segment search — inside ingested media
+
+```bash
+mem segment search "pricing tiers"                # across all assets
+mem segment search "rollback" --asset <asset-id>  # scoped
+mem segment list <asset-id>                       # whole transcript, in order
+mem segment get <segment-id>                      # one span + provenance chain
+```
+
+Searches transcripts, PDF/docx text and OCR output — **not** memories.
+`mem search` and `mem segment search` are separate indexes; a claim recorded
+as a memory will not surface here, and a sentence in an ingested PDF will not
+surface in `mem search`. Check both when the answer could be in either.
+
+Every hit carries its locator: `start_ms`/`end_ms` (audio, video), `page`
+(PDF), `meta.heading` (docx), `speaker`, plus `asset_id`, `derivation_id`,
+`processor`. **Cite the locator, not just the asset** — "at 4:12 in
+<asset>", "page 7". `mem asset get <id>` resolves the asset to a file path.
+
+Segment text is prose-tokenized (`.` is a separator, unlike memory search),
+so `packaging` matches `packaging.`
+
 ## What agents get wrong
 
 **Matching is lexical, not semantic.** Multi-word queries are treated as a
@@ -61,11 +83,39 @@ version to the current one.
 **`secret` memories need `--include-secret`.** Absence is not proof of
 absence.
 
+**An asset may be stored but not yet processed.** Transcription is deferred,
+so a just-ingested recording has no segments until `mem queue run` has
+executed. `mem queue list` shows what is outstanding. An empty
+`mem segment search` on a known asset means check the queue, not that the
+content is absent. Likewise `mem capabilities`: a missing optional dependency
+means that media type yielded metadata only — `warnings` on the asset's
+derivation says which.
+
 **A `contradicts` relation means the memory is disputed.** `context` pulls
 those in on purpose. Say so rather than asserting one side.
 
 Confidence and salience are the author's calibration: `confidence` is how
 sure, `salience` is how much it matters. Low confidence is worth hedging.
+
+## Conflicts and duplicates
+
+```bash
+mem consolidate                        # duplicates, contradictions, stale — read-only
+mem consolidate --type preference      # narrow the scan
+mem source orphans                     # memories whose provenance was deleted
+```
+
+Returns `{by_kind, proposals[{kind, verb, memory_ids, score, rationale,
+arguments}]}`. **Reports only; writes nothing.** `kind` is `duplicate`,
+`near-duplicate`, `contradiction`, or `stale`; `verb` + `arguments` are the
+command to run if you agree.
+
+`stale` means the author's own `review_after`/`valid_until` has passed — treat
+it as unconfirmed, not wrong. `near-duplicate` and `contradiction` need a
+human or your judgement; don't merge on a score alone.
+
+Tagged `provenance-lost` = its source was deleted. The claim may still hold,
+but nothing backs it. Say so.
 
 ## Errors
 

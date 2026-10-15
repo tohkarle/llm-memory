@@ -88,6 +88,54 @@ deleted before. That is the system refusing to resurrect something the user
 removed. Do not retry with `--force-recreate` unless they explicitly ask for
 it again — tell them it was previously deleted and let them decide.
 
+## Finding duplicates before you add more
+
+```bash
+mem consolidate                                   # proposals, writes nothing
+mem consolidate --apply --yes                     # execute duplicate merges only
+```
+
+Cheaper than `search` for a cleanup pass. `--apply` merges exact/high-overlap
+duplicates; `contradiction` and `stale` stay advisory because a replacement
+needs content only you have. One merge per pass per memory — rerun to cascade.
+
+## Extraction
+
+```bash
+mem extract --file conversations/x.md --source conversation:conversations/x.md
+mem extract --stdin --source conversation:x.md --commit --min-confidence 0.7
+```
+
+`--source` is required: a candidate with no provenance is refused. Review
+before `--commit`; candidates carry `duplicate_of` and a `rationale`.
+Confidence 0.5 = pattern-matched, verify it. `--llm` uses a configured
+provider (`mem provider show`); without one, the deterministic path runs
+anyway.
+
+## Deleting source material
+
+```bash
+mem source plan-delete conversations/x.md         # full blast radius
+mem source delete conversations/x.md --yes        # orphans citing memories
+mem source delete conversations/x.md --memories purge --yes
+```
+
+Removes transcripts, segments, derivations and assets too. Default `orphan`
+keeps memories and tags them `provenance-lost`; `purge` writes tombstones so
+they can't be re-extracted. **Always plan first** — it is irreversible.
+
+## Backup and export
+
+```bash
+mem backup create --label "before cleanup"
+mem export --out mem.jsonl        &&  mem import mem.jsonl
+mem backup prune --keep-days 90 --keep-count 10 --yes
+```
+
+Archives exclude the index (rebuildable) and always include tombstones.
+Import is additive and **cannot resurrect a purged memory** — exporting first
+is not a way around a deletion. Before any bulk operation, back up.
+
 ## Attachments
 
 ```bash
