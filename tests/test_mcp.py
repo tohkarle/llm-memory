@@ -417,6 +417,56 @@ class TestServerShell:
 
         assert build_server() is not None
 
+    def test_handlers_round_trip_through_a_real_session(self, root: Path, monkeypatch: Any) -> None:
+        """Drive the server through an actual client, not just construct it.
+
+        Constructing ``Server`` proves the constructor signature; it proves
+        nothing about handler *registration*, which in mcp 1.x happens via
+        decorators and in 2.x via constructor callbacks. A version bump that
+        moves either would leave ``build_server() is not None`` passing while
+        every tool call failed, so this exercises the protocol end to end:
+        list the tools, call one, and read the result back.
+        """
+        pytest.importorskip("mcp")
+        import anyio
+        from mcp.shared.memory import create_connected_server_and_client_session as connect
+
+        from memory.mcp_server import build_server
+
+        monkeypatch.setenv("MEMORY_ROOT", str(root))
+        source = root / "ingest-me.md"
+        source.write_text("Rollback reverts the release tag.\n", encoding="utf-8")
+
+        async def exercise() -> dict[str, Any]:
+            async with connect(build_server()) as client:
+                await client.initialize()
+                listed = await client.list_tools()
+                created = await client.call_tool(
+                    "memory_create",
+                    {"type": "fact", "title": "Round trip", "body": "via a real session"},
+                )
+                unknown = await client.call_tool("not_a_real_tool", {})
+                return {
+                    "names": {t.name for t in listed.tools},
+                    "annotated": all(t.annotations is not None for t in listed.tools),
+                    "created_error": created.isError,
+                    "created_payload": json.loads(created.content[0].text),
+                    "unknown_error": unknown.isError,
+                }
+
+        out = anyio.run(exercise)
+
+        # The whole surface must survive registration, not just build.
+        assert out["names"] == set(HANDLERS)
+        assert out["annotated"]
+        # A success and a failure must be distinguishable *as protocol flags*.
+        # CallToolResult's field is `isError`; the snake_case spelling is
+        # silently dropped by pydantic, which once made every failure look
+        # like a success to the client.
+        assert out["created_error"] is False
+        assert out["created_payload"]["ok"] is True
+        assert out["unknown_error"] is True
+
     def test_advertises_every_tool_with_annotations(self) -> None:
         pytest.importorskip("mcp")
         from memory.mcp_server import tool_definitions
