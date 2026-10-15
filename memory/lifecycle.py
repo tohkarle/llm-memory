@@ -58,6 +58,15 @@ def rebuild_index(
     if db.missing_tables(conn):
         db.init_schema(conn)
     db.clear_all(conn)
+    # A rebuild is the user's "make the index right" lever, so it owns the
+    # index *structure*, not just its contents: an FTS table whose definition
+    # drifted (an older build's tokenizer) is dropped and recreated here,
+    # because refilling a stale table would leave it stale. This runs after
+    # `clear_all` -- deleting from an external-content FTS index needs the
+    # table that was built alongside `memories`, not a fresh empty one.
+    for name in sorted(db.stale_virtual_tables(conn)):
+        conn.execute(f"DROP TABLE IF EXISTS {name}")
+    db.init_schema(conn)
 
     # ---- memories (base rows first, FTS in one pass at the end)
     for path in paths.memory_glob():

@@ -34,6 +34,7 @@ pass over a stale index.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from collections.abc import Callable, Iterable
 from datetime import datetime
@@ -391,11 +392,9 @@ def _migrate_1_to_2(conn: sqlite3.Connection) -> None:
     already holds the text.
     """
     conn.executescript(DDL)
-    # Drop and recreate rather than trusting IF NOT EXISTS: an index built by
-    # an earlier v2 build may have the old tokenizer, and a virtual table's
-    # tokenizer cannot be altered in place.
-    conn.execute("DROP TABLE IF EXISTS segments_fts")
-    conn.executescript(DDL)
+    # No tokenizer repair here: a stale virtual table is a structural property
+    # of the file, not of its version stamp, so it is detected and repaired by
+    # `repair_virtual_tables` on every open instead of only on this upgrade.
     rebuild_segments_fts(conn)
 
 
@@ -415,6 +414,9 @@ def migrate(conn: sqlite3.Connection) -> None:
     """
     current = schema_version(conn)
     if current == SCHEMA_VERSION:
+        # Up to date by version, which says nothing about whether the virtual
+        # tables match this build -- see `repair_virtual_tables`.
+        repair_virtual_tables(conn)
         return
     if current == 0:
         init_schema(conn)
@@ -434,6 +436,7 @@ def migrate(conn: sqlite3.Connection) -> None:
         step(conn)
         set_meta(conn, "schema_version", str(version))
         conn.commit()
+    repair_virtual_tables(conn)
 
 
 def requires_rebuild(conn: sqlite3.Connection) -> str | None:
@@ -444,12 +447,90 @@ def requires_rebuild(conn: sqlite3.Connection) -> str | None:
         missing = missing_tables(conn)
         if missing:
             return f"missing tables: {', '.join(sorted(missing))}"
+        stale = stale_virtual_tables(conn)
+        if stale:
+            return f"stale virtual table definition: {', '.join(sorted(stale))}"
         problems = integrity_check(conn)
         if problems:
             return problems[0]
     except sqlite3.DatabaseError as exc:
         return f"database error: {exc}"
     return None
+
+
+# ------------------------------------------------- virtual table drift
+
+# A virtual table's definition -- its tokenizer above all -- cannot be altered
+# in place, and `CREATE VIRTUAL TABLE IF NOT EXISTS` silently keeps whatever
+# the file already has. So an index built by an older build keeps that build's
+# tokenizer forever, and the symptom is not an error but search quietly
+# returning nothing.
+#
+# The schema version is the wrong signal for this: the stale table and the
+# fixed one are both v2, so a version gate never fires on exactly the file
+# that needs repairing. These two functions compare the *live* definition in
+# `sqlite_master` against the one in `DDL` instead, which catches any future
+# virtual-table change without anyone remembering to add a migration.
+
+
+def _normalize_ddl(sql: str) -> str:
+    """Collapse whitespace and strip SQL comments, for comparing definitions.
+
+    `sqlite_master` stores the statement as typed, minus ``IF NOT EXISTS``, so
+    the comparison has to ignore the formatting and the explanatory comments
+    that only exist in the :data:`DDL` source.
+    """
+    sql = re.sub(r"--[^\n]*", " ", sql)
+    sql = sql.replace("IF NOT EXISTS ", "")
+    return re.sub(r"\s+", " ", sql).strip().rstrip(";").lower()
+
+
+def expected_virtual_tables() -> dict[str, str]:
+    """Normalized ``CREATE VIRTUAL TABLE`` statements this build expects."""
+    out: dict[str, str] = {}
+    for match in re.finditer(
+        r"CREATE VIRTUAL TABLE (?:IF NOT EXISTS )?(\w+) USING .*?\);",
+        DDL,
+        re.DOTALL,
+    ):
+        out[match.group(1)] = _normalize_ddl(match.group(0))
+    return out
+
+
+def stale_virtual_tables(conn: sqlite3.Connection) -> set[str]:
+    """Virtual tables whose live definition differs from this build's DDL."""
+    expected = expected_virtual_tables()
+    stale: set[str] = set()
+    placeholders = ",".join("?" * len(expected))
+    rows = conn.execute(
+        f"SELECT name, sql FROM sqlite_master WHERE type = 'table' AND name IN ({placeholders})",
+        sorted(expected),
+    ).fetchall()
+    for row in rows:
+        live = _normalize_ddl(row["sql"] or "")
+        if live != expected[row["name"]]:
+            stale.add(row["name"])
+    return stale
+
+
+def repair_virtual_tables(conn: sqlite3.Connection) -> set[str]:
+    """Drop, recreate and repopulate any virtual table whose DDL has drifted.
+
+    Returns the names repaired. Safe to call on every open: when nothing has
+    drifted it is one `sqlite_master` read and no writes.
+    """
+    stale = stale_virtual_tables(conn)
+    if not stale:
+        return stale
+    for name in sorted(stale):
+        conn.execute(f"DROP TABLE IF EXISTS {name}")
+    conn.executescript(DDL)
+    if "segments_fts" in stale:
+        rebuild_segments_fts(conn)
+    if "memories_fts" in stale:
+        conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
+    conn.commit()
+    return stale
 
 
 EXPECTED_TABLES = frozenset(

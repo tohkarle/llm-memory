@@ -661,3 +661,111 @@ class TestSearchPrerequisites:
         add(conn, make_memory(title="Normal thing"))
         rows = conn.execute("SELECT id FROM memories WHERE sensitivity != 'secret'").fetchall()
         assert len(rows) == 1
+
+
+class TestVirtualTableDrift:
+    """An index built by an older build must not keep that build's tokenizer.
+
+    `CREATE VIRTUAL TABLE IF NOT EXISTS` silently preserves whatever is on
+    disk, and the schema version cannot distinguish the stale table from the
+    fixed one -- both are v2. So the checks here construct the stale state the
+    way the old build actually left it: the superseded DDL, stamped v2.
+    """
+
+    #: Verbatim `segments_fts` definition from the build that shipped '.' as a
+    #: token character. Hardcoded on purpose: deriving it from the current DDL
+    #: would make this test pass by construction.
+    OLD_SEGMENTS_FTS = """
+    CREATE VIRTUAL TABLE segments_fts USING fts5(
+      segment_id UNINDEXED,
+      text,
+      tokenize   = "unicode61 remove_diacritics 2 tokenchars '-_@.'",
+      prefix     = '2 3 4'
+    );
+    """
+
+    def _stale_v2_index(self, paths: Paths) -> sqlite3.Connection:
+        conn = db.connect(paths)
+        db.init_schema(conn)
+        conn.execute("DROP TABLE segments_fts")
+        conn.executescript(self.OLD_SEGMENTS_FTS)
+        conn.execute(
+            "INSERT INTO assets(id, sha256, media_type, bytes, imported_at, "
+            "blob_path, meta_path) VALUES('a1','h1','audio/mpeg',10,"
+            "'2026-01-01T00:00:00Z','b','m')"
+        )
+        db.index_segment(
+            conn,
+            Segment(id=new_id(), asset_id="a1", ordinal=0, text="We discussed packaging."),
+        )
+        db.set_meta(conn, "schema_version", str(db.SCHEMA_VERSION))
+        conn.commit()
+        return conn
+
+    @staticmethod
+    def _tokenizer(conn: sqlite3.Connection) -> str:
+        row = conn.execute("SELECT sql FROM sqlite_master WHERE name = 'segments_fts'").fetchone()
+        return str(row["sql"])
+
+    @staticmethod
+    def _segment_hits(conn: sqlite3.Connection, query: str) -> int:
+        return len(
+            conn.execute(
+                "SELECT segment_id FROM segments_fts WHERE segments_fts MATCH ?", (query,)
+            ).fetchall()
+        )
+
+    def test_stale_tokenizer_loses_a_word_before_a_period(self, paths: Paths) -> None:
+        """The defect itself, so the rest of the class is known to be testing it."""
+        conn = self._stale_v2_index(paths)
+        assert self._segment_hits(conn, "packaging") == 0
+        conn.close()
+
+    def test_requires_rebuild_reports_a_stale_virtual_table(self, paths: Paths) -> None:
+        conn = self._stale_v2_index(paths)
+        reason = db.requires_rebuild(conn)
+        assert reason is not None and "segments_fts" in reason
+        conn.close()
+
+    def test_migrate_repairs_a_v2_stamped_stale_tokenizer(self, paths: Paths) -> None:
+        """The version gate cannot catch this: the index is already v2."""
+        conn = self._stale_v2_index(paths)
+        assert db.schema_version(conn) == db.SCHEMA_VERSION
+        db.migrate(conn)
+        assert "'-_@.'" not in self._tokenizer(conn)
+        assert self._segment_hits(conn, "packaging") == 1
+        assert db.requires_rebuild(conn) is None
+        conn.close()
+
+    def test_rebuild_index_repairs_index_structure(self, paths: Paths) -> None:
+        """`mem rebuild` must repair structure, not just refill a stale table."""
+        from memory.lifecycle import rebuild_index
+
+        conn = self._stale_v2_index(paths)
+        rebuild_index(paths, conn)
+        assert "'-_@.'" not in self._tokenizer(conn)
+        assert db.stale_virtual_tables(conn) == set()
+        conn.close()
+
+    def test_memories_fts_keeps_its_period_tokenchar(self, paths: Paths) -> None:
+        """The two indexes differ deliberately; drift repair must not merge them."""
+        conn = db.connect(paths)
+        db.init_schema(conn)
+        row = conn.execute("SELECT sql FROM sqlite_master WHERE name='memories_fts'").fetchone()
+        assert "'-_@.'" in str(row["sql"])
+        assert db.stale_virtual_tables(conn) == set()
+        conn.close()
+
+    def test_drift_detection_is_not_specific_to_the_tokenizer(self, paths: Paths) -> None:
+        """Any virtual-table definition change must be caught, not just this one."""
+        conn = db.connect(paths)
+        db.init_schema(conn)
+        conn.execute("DROP TABLE segments_fts")
+        conn.executescript(
+            "CREATE VIRTUAL TABLE segments_fts USING fts5(segment_id UNINDEXED, text);"
+        )
+        conn.commit()
+        assert db.stale_virtual_tables(conn) == {"segments_fts"}
+        assert db.repair_virtual_tables(conn) == {"segments_fts"}
+        assert db.stale_virtual_tables(conn) == set()
+        conn.close()
