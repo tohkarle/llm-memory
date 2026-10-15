@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from datetime import datetime
 from typing import Any
 
@@ -50,7 +50,7 @@ from .models import (
 )
 from .paths import Paths
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 #: Minimum SQLite that supports everything used here (FTS5 'delete' command,
 #: WITHOUT ROWID, partial indexes, json1).
@@ -260,6 +260,39 @@ CREATE INDEX IF NOT EXISTS ix_deriv_asset  ON derivations(asset_id, kind);
 CREATE INDEX IF NOT EXISTS ix_deriv_status ON derivations(status)
                                             WHERE status IN ('pending','failed');
 
+-- ─────────────────────────────── work queue ─────────────────────────────
+-- Durable, retryable background work. A row survives process death: nothing
+-- is held in memory, and `claimed_at` is a lease, not a lock, so a worker
+-- killed mid-task has its task reclaimed once the lease expires rather than
+-- stranding it forever.
+CREATE TABLE IF NOT EXISTS work_queue (
+  id           TEXT PRIMARY KEY,
+  kind         TEXT NOT NULL,
+  asset_id     TEXT,
+  source_id    TEXT,
+  payload      TEXT NOT NULL DEFAULT '{}',
+  status       TEXT NOT NULL DEFAULT 'pending' CHECK (status IN
+                 ('pending','running','done','failed','cancelled')),
+  priority     INTEGER NOT NULL DEFAULT 100,
+  attempts     INTEGER NOT NULL DEFAULT 0,
+  max_attempts INTEGER NOT NULL DEFAULT 3,
+  last_error   TEXT,
+  enqueued_at  TEXT NOT NULL,
+  claimed_at   TEXT,
+  lease_expires_at TEXT,
+  finished_at  TEXT,
+  not_before   TEXT,
+  dedupe_key   TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_wq_ready  ON work_queue(status, priority, enqueued_at)
+                                         WHERE status IN ('pending','running');
+CREATE INDEX IF NOT EXISTS ix_wq_asset  ON work_queue(asset_id);
+-- Only one live task per dedupe key: re-ingesting the same asset must not
+-- queue a second transcription of it.
+CREATE UNIQUE INDEX IF NOT EXISTS ux_wq_dedupe ON work_queue(dedupe_key)
+                                         WHERE dedupe_key IS NOT NULL
+                                           AND status IN ('pending','running');
+
 -- ─────────────────────────────── FTS5 ───────────────────────────────────
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
   title, body, tags, entities,
@@ -267,6 +300,19 @@ CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
   content_rowid = 'rowid',
   tokenize      = "unicode61 remove_diacritics 2 tokenchars '-_@.'",
   prefix        = '2 3 4'
+);
+
+-- Segment text, so a phrase inside a transcript or a PDF page is findable.
+-- `segments` has a TEXT primary key and therefore no stable usable rowid to
+-- hang external content on, so this index is contentful: it stores its own
+-- copy of the text and `segment_id` maps a hit back to the row. The cost is
+-- duplicated text; the benefit is that segment reindexing is a plain
+-- delete-then-insert with no old-value bookkeeping.
+CREATE VIRTUAL TABLE IF NOT EXISTS segments_fts USING fts5(
+  segment_id UNINDEXED,
+  text,
+  tokenize   = "unicode61 remove_diacritics 2 tokenchars '-_@.'",
+  prefix     = '2 3 4'
 );
 """
 
@@ -331,11 +377,31 @@ def schema_version(conn: sqlite3.Connection) -> int:
         return 0
 
 
+def _migrate_1_to_2(conn: sqlite3.Connection) -> None:
+    """Add ``work_queue`` and ``segments_fts``.
+
+    Purely additive, so no data moves: ``executescript(DDL)`` is idempotent
+    (every statement is ``IF NOT EXISTS``) and creates exactly the two new
+    tables. The segment index is then populated from ``segments``, which
+    already holds the text.
+    """
+    conn.executescript(DDL)
+    rebuild_segments_fts(conn)
+
+
+#: Ordered in-place upgrade steps, keyed by the version each one produces.
+#: A migration lands here rather than forcing a rebuild whenever the change
+#: is additive, because a rebuild of a large root is minutes of work.
+MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
+    2: _migrate_1_to_2,
+}
+
+
 def migrate(conn: sqlite3.Connection) -> None:
     """Upgrade an older index in place.
 
-    No-op at v1. Later versions dispatch through a table of step functions so
-    an upgrade never requires a full rebuild unless the data genuinely moved.
+    Steps run in version order and each one commits, so an interrupted
+    upgrade resumes from where it stopped rather than restarting.
     """
     current = schema_version(conn)
     if current == SCHEMA_VERSION:
@@ -343,9 +409,21 @@ def migrate(conn: sqlite3.Connection) -> None:
     if current == 0:
         init_schema(conn)
         return
-    raise SchemaError(
-        f"index schema v{current} cannot be migrated to v{SCHEMA_VERSION}; run `mem rebuild`"
-    )
+    if current > SCHEMA_VERSION:
+        raise SchemaError(
+            f"index schema v{current} is newer than this build's v{SCHEMA_VERSION}; "
+            "upgrade `mem`, or delete the index and run `mem rebuild` with this build"
+        )
+    for version in range(current + 1, SCHEMA_VERSION + 1):
+        step = MIGRATIONS.get(version)
+        if step is None:
+            raise SchemaError(
+                f"index schema v{current} cannot be migrated to "
+                f"v{SCHEMA_VERSION}; run `mem rebuild`"
+            )
+        step(conn)
+        set_meta(conn, "schema_version", str(version))
+        conn.commit()
 
 
 def requires_rebuild(conn: sqlite3.Connection) -> str | None:
@@ -379,6 +457,8 @@ EXPECTED_TABLES = frozenset(
         "relations",
         "derivations",
         "memories_fts",
+        "segments_fts",
+        "work_queue",
     }
 )
 
@@ -746,6 +826,45 @@ def index_segment(conn: sqlite3.Connection, s: Segment) -> None:
             "meta": json.dumps(s.meta),
         },
     )
+    # Contentful FTS: delete-then-insert, so an updated segment does not
+    # accumulate a second indexed copy of its old text.
+    conn.execute("DELETE FROM segments_fts WHERE segment_id = ?", (s.id,))
+    conn.execute("INSERT INTO segments_fts(segment_id, text) VALUES(?, ?)", (s.id, s.text))
+
+
+def unindex_segments_for(
+    conn: sqlite3.Connection,
+    *,
+    asset_id: str | None = None,
+    derivation_id: str | None = None,
+) -> int:
+    """Drop a derivation's (or asset's) segments and their FTS rows.
+
+    Needed because reprocessing can produce *fewer* segments than before, and
+    the upsert in :func:`index_segment` would leave the surplus behind.
+    """
+    if derivation_id is not None:
+        where, param = "derivation_id = ?", derivation_id
+    elif asset_id is not None:
+        where, param = "asset_id = ?", asset_id
+    else:
+        raise ValueError("pass asset_id or derivation_id")
+    ids = [r["id"] for r in conn.execute(f"SELECT id FROM segments WHERE {where}", (param,))]
+    for sid in ids:
+        conn.execute("DELETE FROM segments_fts WHERE segment_id = ?", (sid,))
+    conn.execute(f"DELETE FROM segments WHERE {where}", (param,))
+    return len(ids)
+
+
+def rebuild_segments_fts(conn: sqlite3.Connection) -> int:
+    """Repopulate the segment index from ``segments``, which is authoritative."""
+    conn.execute("DELETE FROM segments_fts")
+    rows = conn.execute("SELECT id, text FROM segments").fetchall()
+    conn.executemany(
+        "INSERT INTO segments_fts(segment_id, text) VALUES(?, ?)",
+        [(r["id"], r["text"]) for r in rows],
+    )
+    return len(rows)
 
 
 def index_tombstone(conn: sqlite3.Connection, t: Tombstone, *, path: str) -> None:
@@ -819,6 +938,7 @@ def clear_all(conn: sqlite3.Connection) -> None:
     """Empty every table, for a full rebuild. Order respects foreign keys."""
     for table in (
         "memories_fts",
+        "segments_fts",
         "segments",
         "derivations",
         "memory_sources",

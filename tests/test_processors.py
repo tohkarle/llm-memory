@@ -100,7 +100,35 @@ class TestResolution:
         assert found is not None and found.name == "text"
 
     def test_unknown_type_resolves_to_nothing(self, tmp_path: Path) -> None:
-        assert for_media("video/mp4", tmp_path / "a.mp4") is None
+        """A type no processor claims must resolve to nothing, not a guess.
+
+        Phase 3 registered image/audio/video/document, so this uses a type
+        outside every registered processor's range.
+        """
+        assert for_media("application/x-sqlite3", tmp_path / "a.db") is None
+        assert for_media("application/zip", tmp_path / "a.zip") is None
+
+    @pytest.mark.parametrize(
+        ("media_type", "suffix", "expected"),
+        [
+            ("image/png", ".png", "image"),
+            ("audio/mpeg", ".mp3", "audio"),
+            ("video/mp4", ".mp4", "video"),
+            ("application/pdf", ".pdf", "document"),
+            (
+                "application/vnd.openxmlformats-officedocument."
+                "wordprocessingml.document",
+                ".docx",
+                "document",
+            ),
+            ("text/markdown", ".md", "text"),
+        ],
+    )
+    def test_media_processors_are_resolvable(
+        self, tmp_path: Path, media_type: str, suffix: str, expected: str
+    ) -> None:
+        found = for_media(media_type, tmp_path / f"input{suffix}")
+        assert found is not None and found.name == expected
 
     def test_exact_match_beats_wildcard(self, clean_registry: None, tmp_path: Path) -> None:
         """A future audio/wav processor must win over a generic audio/* one."""
@@ -118,6 +146,9 @@ class TestResolution:
             def process(self, path: Path, ctx: ProcessContext) -> ProcessResult:
                 return ProcessResult()
 
+        # Isolated: the real audio processor also claims audio/wav exactly,
+        # and this test is about ranking, not about which one ships.
+        REGISTRY.clear()
         register(Wildcard())
         register(StubProcessor())
         found = for_media("audio/wav", tmp_path / "a.wav")
