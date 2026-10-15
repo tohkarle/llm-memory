@@ -11,13 +11,14 @@ the next open. The filesystem is the source of truth; the index catches up.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import TracebackType
 from typing import Any, Self
 
-from . import db
+from . import db, media
 from .context import ContextResult, get_context
 from .journal import Journal, RecoveryReport
 from .models import (
@@ -229,7 +230,14 @@ class MemoryAPI:
             # the gap here rather than trusting the journal to have flagged it.
             drifted = self._reconcile_drift()
 
-            if report.unindex or pending or drifted:
+            # A worker killed mid-task leaves a claimed queue row. Returning
+            # it here means the next command picks it up, rather than it
+            # waiting for someone to run the queue explicitly.
+            from . import workqueue
+
+            reaped = workqueue.reap_expired(self.conn)
+
+            if report.unindex or pending or drifted or reaped:
                 self.conn.commit()
 
     def _reconcile_drift(self) -> int:
@@ -853,7 +861,13 @@ class MemoryAPI:
         JSON, YAML frontmatter in Markdown), because that header is what lets
         ``rebuild_index`` reconstruct these rows from the filesystem alone.
         This method and the rebuild path therefore agree by construction.
+
+        ``cost_ms`` is accepted for call-site convenience but is only indexed
+        when the processor embedded it in that header, for the same reason:
+        anything this method stores that the header lacks is state a rebuild
+        would silently drop.
         """
+        del cost_ms
         self._require_writable()
         from .lifecycle import read_derivation_header
 
@@ -881,7 +895,11 @@ class MemoryAPI:
             # Absent in the header means absent, full stop. Inventing a value
             # here would be a field the rebuild cannot reproduce.
             "completed_at": header.get("completed_at"),
-            "cost_ms": header.get("cost_ms", cost_ms),
+            # `cost_ms` obeys the same rule. The caller's measurement is only
+            # used when the processor embedded it, because a timing that lives
+            # in the index alone makes `rebuild` produce a different row --
+            # which tests/test_rebuild_equivalence.py asserts cannot happen.
+            "cost_ms": header.get("cost_ms"),
         }
         with self.journal:
             db.index_derivation(self.conn, row)
@@ -904,6 +922,164 @@ class MemoryAPI:
                 )
             self.conn.commit()
         return row
+
+    # ------------------------------------------------------------------ ingestion
+
+    def ingest(self, path: Path | str, **kwargs: Any) -> dict[str, Any]:
+        """Import a file and derive searchable content from it.
+
+        Cheap processors run inline; expensive ones are queued. See
+        :mod:`memory.ingestion`.
+        """
+        self._require_writable()
+        from .ingestion import ingest
+
+        return ingest(self, Path(path), **kwargs).to_json()
+
+    def ingest_directory(self, directory: Path | str, **kwargs: Any) -> list[dict[str, Any]]:
+        self._require_writable()
+        from .ingestion import ingest_directory
+
+        return [r.to_json() for r in ingest_directory(self, Path(directory), **kwargs)]
+
+    def process_asset(self, asset_id: str, **kwargs: Any) -> dict[str, Any]:
+        """Derive content for an asset that is already stored."""
+        self._require_writable()
+        from .ingestion import process_asset
+
+        return process_asset(self, asset=asset_id, **kwargs)
+
+    def search_segments(
+        self,
+        query: str,
+        *,
+        asset_id: str | None = None,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Full-text search over segments, with provenance on every hit.
+
+        Returns the locator a citation needs: the asset, the derivation, and
+        whichever of timestamp/page/bbox the processor recorded.
+        """
+        from .search import fts_query
+
+        sql = """
+            SELECT s.id, s.asset_id, s.derivation_id, s.source_id, s.ordinal,
+                   s.text, s.start_ms, s.end_ms, s.page, s.bbox, s.speaker,
+                   s.meta, bm25(segments_fts) AS rank,
+                   d.kind, d.processor, d.output_path,
+                   a.media_type, a.original_filename
+              FROM segments_fts
+              JOIN segments    s ON s.id = segments_fts.segment_id
+              LEFT JOIN derivations d ON d.id = s.derivation_id
+              LEFT JOIN assets      a ON a.id = s.asset_id
+             WHERE segments_fts MATCH ?
+        """
+        params: list[Any] = [fts_query(query)]
+        if asset_id:
+            sql += " AND s.asset_id = ?"
+            params.append(asset_id)
+        sql += " ORDER BY rank LIMIT ?"
+        params.append(limit)
+
+        out: list[dict[str, Any]] = []
+        for row in self.conn.execute(sql, params):
+            out.append(
+                {
+                    "segment_id": row["id"],
+                    "asset_id": row["asset_id"],
+                    "derivation_id": row["derivation_id"],
+                    "source_id": row["source_id"],
+                    "ordinal": row["ordinal"],
+                    "text": row["text"],
+                    "start_ms": row["start_ms"],
+                    "end_ms": row["end_ms"],
+                    "page": row["page"],
+                    "bbox": row["bbox"],
+                    "speaker": row["speaker"],
+                    "meta": json.loads(row["meta"] or "{}"),
+                    "kind": row["kind"],
+                    "processor": row["processor"],
+                    "output_path": row["output_path"],
+                    "media_type": row["media_type"],
+                    "original_filename": row["original_filename"],
+                    "score": -float(row["rank"]) if row["rank"] is not None else 0.0,
+                }
+            )
+        return out
+
+    def get_segment(self, segment_id: str) -> dict[str, Any] | None:
+        """One segment with its full provenance chain."""
+        row = self.conn.execute(
+            """
+            SELECT s.*, d.kind, d.processor, d.processor_version, d.output_path,
+                   a.media_type, a.original_filename, a.sha256
+              FROM segments s
+              LEFT JOIN derivations d ON d.id = s.derivation_id
+              LEFT JOIN assets      a ON a.id = s.asset_id
+             WHERE s.id = ?
+            """,
+            (segment_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        payload = _row_to_dict(row)
+        payload["meta"] = json.loads(payload.get("meta") or "{}")
+        return payload
+
+    def asset_segments(self, asset_id: str, *, limit: int = 500) -> list[dict[str, Any]]:
+        """Every segment derived from one asset, in order."""
+        rows = self.conn.execute(
+            "SELECT id, ordinal, text, start_ms, end_ms, page, speaker, derivation_id "
+            "FROM segments WHERE asset_id = ? ORDER BY ordinal LIMIT ?",
+            (asset_id, limit),
+        )
+        return [_row_to_dict(r) for r in rows]
+
+    # ------------------------------------------------------------------ queue
+
+    def queue_list(self, **kwargs: Any) -> list[dict[str, Any]]:
+        from . import workqueue
+
+        return [t.to_json() for t in workqueue.listing(self.conn, **kwargs)]
+
+    def queue_stats(self) -> dict[str, Any]:
+        from . import workqueue
+
+        return workqueue.stats(self.conn)
+
+    def queue_run(self, *, limit: int | None = None, lease_s: int | None = None) -> dict[str, Any]:
+        """Drain ready tasks, running each one's processor."""
+        self._require_writable()
+        from . import workqueue
+        from .ingestion import run_queued_task
+
+        def handler(task: workqueue.Task) -> dict[str, Any]:
+            return run_queued_task(self, task)
+
+        kwargs: dict[str, Any] = {"limit": limit}
+        if lease_s is not None:
+            kwargs["lease_s"] = lease_s
+        return workqueue.drain(self.conn, handler, **kwargs)
+
+    def queue_retry(self, **kwargs: Any) -> dict[str, Any]:
+        self._require_writable()
+        from . import workqueue
+
+        revived = workqueue.retry(self.conn, **kwargs)
+        return {"retried": revived, "count": len(revived), **workqueue.stats(self.conn)}
+
+    def queue_cancel(self, task_id: str) -> dict[str, Any]:
+        self._require_writable()
+        from . import workqueue
+
+        return {"task_id": task_id, "cancelled": workqueue.cancel(self.conn, task_id)}
+
+    def queue_purge(self, *, keep_days: int = 7) -> dict[str, Any]:
+        self._require_writable()
+        from . import workqueue
+
+        return {"removed": workqueue.purge(self.conn, keep_days=keep_days)}
 
     # ------------------------------------------------------------------ maintenance
 
@@ -982,10 +1158,17 @@ class MemoryAPI:
             "open_journal_ops": open_ops,
             "last_recovery": self.recovery.to_json() if self.recovery else None,
             "ffmpeg": shutil.which("ffmpeg"),
+            "media": media.capability_report(),
+            "queue": self.queue_stats(),
         }
 
 
 # ---------------------------------------------------------------- helpers
+
+
+def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    """``sqlite3.Row`` is not a mapping -- ``in`` tests values, not keys."""
+    return {key: row[key] for key in row.keys()}  # noqa: SIM118
 
 
 def _install_health() -> dict[str, Any]:

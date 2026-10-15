@@ -311,7 +311,12 @@ CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
 CREATE VIRTUAL TABLE IF NOT EXISTS segments_fts USING fts5(
   segment_id UNINDEXED,
   text,
-  tokenize   = "unicode61 remove_diacritics 2 tokenchars '-_@.'",
+  -- Note the tokenchars: '-_@' but NOT '.', unlike memories_fts. Segment
+  -- text is prose, where a trailing period is sentence punctuation, so
+  -- treating '.' as a word character would index "packaging." and leave a
+  -- search for "packaging" with no hit. Memory titles are short labels where
+  -- '.' carries meaning (version numbers, filenames), hence the difference.
+  tokenize   = "unicode61 remove_diacritics 2 tokenchars '-_@'",
   prefix     = '2 3 4'
 );
 """
@@ -385,6 +390,11 @@ def _migrate_1_to_2(conn: sqlite3.Connection) -> None:
     tables. The segment index is then populated from ``segments``, which
     already holds the text.
     """
+    conn.executescript(DDL)
+    # Drop and recreate rather than trusting IF NOT EXISTS: an index built by
+    # an earlier v2 build may have the old tokenizer, and a virtual table's
+    # tokenizer cannot be altered in place.
+    conn.execute("DROP TABLE IF EXISTS segments_fts")
     conn.executescript(DDL)
     rebuild_segments_fts(conn)
 

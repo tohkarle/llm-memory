@@ -64,6 +64,7 @@ def write_derived(
     meta: dict[str, Any],
     extra: dict[str, Any] | None = None,
     status: str = "complete",
+    cost_ms: int | None = None,
 ) -> tuple[DerivedArtifact | None, str | None]:
     """Write one derived JSON file and return it with its derivation id.
 
@@ -87,14 +88,20 @@ def write_derived(
         segment.derivation_id = did
 
     stamp = fmt_ts(now_utc())
+    header: dict[str, Any] = {
+        **key,
+        "id": did,
+        "status": status,
+        "created_at": stamp,
+        "completed_at": stamp if status == "complete" else None,
+    }
+    # Only when measured. Every field the index holds must come from this
+    # header, or a rebuild cannot reproduce the row -- which is precisely the
+    # index-only state the derived-file header exists to prevent.
+    if cost_ms is not None:
+        header["cost_ms"] = cost_ms
     payload: dict[str, Any] = {
-        "_derivation": {
-            **key,
-            "id": did,
-            "status": status,
-            "created_at": stamp,
-            "completed_at": stamp if status == "complete" else None,
-        },
+        "_derivation": header,
         "meta": meta,
         "segments": [segment_payload(s) for s in segments],
     }

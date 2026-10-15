@@ -39,6 +39,10 @@ def rebuild_index(
     Tolerant by design: an unparseable file is reported and skipped rather
     than aborting the rebuild, because partial corruption must not cost you
     the other 199 memories.
+
+    ``work_queue`` is deliberately untouched. Every other table is derived
+    state that the filesystem can reproduce; a pending background task is
+    not, so clearing it here would silently drop queued work.
     """
     store = Store(paths, journal or Journal(paths))
     errors: list[dict[str, str]] = []
@@ -123,6 +127,11 @@ def rebuild_index(
             counts["segments"] += 1
 
     counts["sources"] = conn.execute("SELECT count(*) c FROM sources").fetchone()["c"]
+
+    # `index_segment` keeps segments_fts in step row by row, but a bulk
+    # rebuild is far cheaper as one repopulation, and this also repairs an
+    # index left behind by an older build.
+    db.rebuild_segments_fts(conn)
 
     db.set_meta(conn, "schema_version", str(db.SCHEMA_VERSION))
     db.set_meta(conn, "built_at", _now())
