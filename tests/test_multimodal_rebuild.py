@@ -335,3 +335,19 @@ class TestSchemaMigration:
         api.close()
         with pytest.raises(db.SchemaError, match="newer than this build"):
             MemoryAPI(root).open()
+
+    def test_a_future_schema_is_refused_on_a_read_only_open_too(self, tmp_path: Path) -> None:
+        """A reader cannot migrate, but it must not answer [] either.
+
+        `migrate` runs writer-only, so a read-only open used to succeed on an
+        index a newer build wrote and then return nothing for every query --
+        indistinguishable from an empty root.
+        """
+        root = tmp_path / "root"
+        api = MemoryAPI.initialize(root)
+        db.set_meta(api.conn, "schema_version", "99")
+        api.conn.commit()
+        api.close()
+
+        with pytest.raises(db.SchemaError, match="newer than this build"):
+            MemoryAPI(root, read_only=True).open()

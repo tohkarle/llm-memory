@@ -421,11 +421,7 @@ def migrate(conn: sqlite3.Connection) -> None:
     if current == 0:
         init_schema(conn)
         return
-    if current > SCHEMA_VERSION:
-        raise SchemaError(
-            f"index schema v{current} is newer than this build's v{SCHEMA_VERSION}; "
-            "upgrade `mem`, or delete the index and run `mem rebuild` with this build"
-        )
+    check_not_newer(conn)
     for version in range(current + 1, SCHEMA_VERSION + 1):
         step = MIGRATIONS.get(version)
         if step is None:
@@ -437,6 +433,21 @@ def migrate(conn: sqlite3.Connection) -> None:
         set_meta(conn, "schema_version", str(version))
         conn.commit()
     repair_virtual_tables(conn)
+
+
+def check_not_newer(conn: sqlite3.Connection) -> None:
+    """Refuse an index a newer build wrote.
+
+    Separate from :func:`migrate` because a read-only connection never calls
+    migrate and would otherwise open such an index happily, then answer every
+    query with nothing.
+    """
+    current = schema_version(conn)
+    if current > SCHEMA_VERSION:
+        raise SchemaError(
+            f"index schema v{current} is newer than this build's v{SCHEMA_VERSION}; "
+            "upgrade `mem`, or delete the index and run `mem rebuild` with this build"
+        )
 
 
 def requires_rebuild(conn: sqlite3.Connection) -> str | None:

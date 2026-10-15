@@ -178,7 +178,14 @@ class MemoryAPI:
             )
         conn = db.connect(self.paths, read_only=self.read_only)
         try:
-            if not self.read_only:
+            if self.read_only:
+                # A reader cannot migrate, but it must not pretend an index it
+                # does not understand is empty: a newer build's schema may have
+                # moved the rows this one queries, and every search would
+                # return [] with no error at all. Raise the same actionable
+                # message the writer path raises.
+                db.check_not_newer(conn)
+            else:
                 db.migrate(conn)
             self._conn = conn
         except BaseException:
