@@ -197,6 +197,10 @@ def enqueue(
         if row is None:
             raise
         return Task.from_row(row)
+    # Commit here rather than leaving it to the caller: a queued task that is
+    # rolled back when the connection closes is work silently dropped, and
+    # the caller has already been handed the task id as a promise.
+    conn.commit()
     return task
 
 

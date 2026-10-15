@@ -189,6 +189,25 @@ def parse_relation(raw: str) -> Relation:
     )
 
 
+def parse_params(raw: Sequence[str]) -> dict[str, Any]:
+    """``KEY=VALUE`` pairs into a processor params dict.
+
+    Values are JSON-decoded when they parse, so ``--param ocr=false`` and
+    ``--param target_chars=800`` arrive as a bool and an int rather than
+    strings a processor would have to re-coerce.
+    """
+    out: dict[str, Any] = {}
+    for item in raw:
+        key, sep, value = item.partition("=")
+        if not sep:
+            raise CliError("validation", f"expected KEY=VALUE, got {item!r}", EXIT_VALIDATION)
+        try:
+            out[key.strip()] = json.loads(value)
+        except json.JSONDecodeError:
+            out[key.strip()] = value
+    return out
+
+
 def parse_when(raw: str | None) -> datetime | None:
     if raw is None:
         return None
@@ -1116,6 +1135,296 @@ def export(ctx: click.Context, output_format: str, out: Path | None) -> None:
             api.close()
 
     run("export", action)
+
+
+# ---------------------------------------------------------------- ingestion
+
+
+@main.command()
+@click.argument("path", type=click.Path(exists=True, path_type=Path))
+@click.option("--media-type", help="Override type detection.")
+@click.option("--tag", "tags", multiple=True)
+@click.option("--source", "source_spec", metavar="KIND:REF[:LOCATOR]")
+@click.option("--link-to", "link_to", multiple=True, help="Attach to these memory ids.")
+@click.option("--meta", help="JSON object of extra metadata.")
+@click.option("--param", "params", multiple=True, metavar="KEY=VALUE", help="Processor parameter.")
+@click.option("--no-process", is_flag=True, help="Store the file without deriving content.")
+@click.option("--force", is_flag=True, help="Reprocess even if a cached derivation matches.")
+@click.option(
+    "--defer/--inline",
+    "defer",
+    default=None,
+    help="Override the cost-based lane. Default follows the processor.",
+)
+@click.option("--recursive", is_flag=True, help="For a directory: descend into subdirectories.")
+@click.pass_context
+def ingest(
+    ctx: click.Context,
+    path: Path,
+    media_type: str | None,
+    tags: tuple[str, ...],
+    source_spec: str | None,
+    link_to: tuple[str, ...],
+    meta: str | None,
+    params: tuple[str, ...],
+    no_process: bool,
+    force: bool,
+    defer: bool | None,
+    recursive: bool,
+) -> None:
+    """Import a file (or directory) and derive searchable content from it."""
+
+    def action() -> dict[str, Any]:
+        api = open_api(ctx)
+        try:
+            kwargs: dict[str, Any] = {
+                "media_type": media_type,
+                "tags": list(tags),
+                "source": parse_source(source_spec) if source_spec else None,
+                "meta": json.loads(meta) if meta else None,
+                "link_to": list(link_to),
+                "params": parse_params(params),
+                "process": not no_process,
+                "force": force,
+                "defer": defer,
+            }
+            if path.is_dir():
+                results = api.ingest_directory(path, recursive=recursive, **kwargs)
+                return {
+                    "directory": str(path),
+                    "count": len(results),
+                    "segments": sum(r["segments"] for r in results),
+                    "queued": [r["queued_task"] for r in results if r["queued_task"]],
+                    "errors": [r for r in results if r["status"] == "error"],
+                    "results": results,
+                }
+            return api.ingest(path, **kwargs)
+        finally:
+            api.close()
+
+    run("ingest", action)
+
+
+@main.command("reprocess")
+@click.argument("asset_id")
+@click.option("--param", "params", multiple=True, metavar="KEY=VALUE")
+@click.option("--force", is_flag=True, help="Ignore a matching cached derivation.")
+@click.option("--defer/--inline", "defer", default=None)
+@click.pass_context
+def reprocess(
+    ctx: click.Context,
+    asset_id: str,
+    params: tuple[str, ...],
+    force: bool,
+    defer: bool | None,
+) -> None:
+    """Derive content again for an asset that is already stored."""
+
+    def action() -> dict[str, Any]:
+        api = open_api(ctx)
+        try:
+            return api.process_asset(
+                asset_id, params=parse_params(params), force=force, defer=defer
+            )
+        finally:
+            api.close()
+
+    run("reprocess", action)
+
+
+@main.group()
+def segment() -> None:
+    """Search and inspect segments -- the retrievable spans of an asset."""
+
+
+@segment.command("search")
+@click.argument("query")
+@click.option("--asset", "asset_id", help="Restrict to one asset.")
+@click.option("--limit", type=int, default=20, show_default=True)
+@click.pass_context
+def segment_search(ctx: click.Context, query: str, asset_id: str | None, limit: int) -> None:
+    """Full-text search over segments. Every hit carries its provenance."""
+
+    def action() -> dict[str, Any]:
+        api = open_api(ctx, read_only=True)
+        try:
+            hits = api.search_segments(query, asset_id=asset_id, limit=limit)
+            return {"query": query, "total": len(hits), "hits": hits}
+        finally:
+            api.close()
+
+    run("segment.search", action)
+
+
+@segment.command("get")
+@click.argument("segment_id")
+@click.pass_context
+def segment_get(ctx: click.Context, segment_id: str) -> None:
+    """One segment with its full provenance chain."""
+
+    def action() -> dict[str, Any]:
+        api = open_api(ctx, read_only=True)
+        try:
+            found = api.get_segment(segment_id)
+            if found is None:
+                raise CliError("not_found", f"no segment {segment_id}", EXIT_NOT_FOUND)
+            return found
+        finally:
+            api.close()
+
+    run("segment.get", action)
+
+
+@segment.command("list")
+@click.argument("asset_id")
+@click.option("--limit", type=int, default=500, show_default=True)
+@click.pass_context
+def segment_list(ctx: click.Context, asset_id: str, limit: int) -> None:
+    """Every segment derived from one asset, in order."""
+
+    def action() -> dict[str, Any]:
+        api = open_api(ctx, read_only=True)
+        try:
+            rows = api.asset_segments(asset_id, limit=limit)
+            return {"asset_id": asset_id, "total": len(rows), "segments": rows}
+        finally:
+            api.close()
+
+    run("segment.list", action)
+
+
+# ---------------------------------------------------------------- queue
+
+
+@main.group()
+def queue() -> None:
+    """Inspect and run deferred processing work."""
+
+
+@queue.command("list")
+@click.option("--status", type=click.Choice(["pending", "running", "done", "failed", "cancelled"]))
+@click.option("--kind")
+@click.option("--asset", "asset_id")
+@click.option("--limit", type=int, default=50, show_default=True)
+@click.pass_context
+def queue_list(
+    ctx: click.Context,
+    status: str | None,
+    kind: str | None,
+    asset_id: str | None,
+    limit: int,
+) -> None:
+    """List queued tasks, outstanding work first."""
+
+    def action() -> dict[str, Any]:
+        api = open_api(ctx, read_only=True)
+        try:
+            tasks = api.queue_list(status=status, kind=kind, asset_id=asset_id, limit=limit)
+            return {"total": len(tasks), "stats": api.queue_stats(), "tasks": tasks}
+        finally:
+            api.close()
+
+    run("queue.list", action)
+
+
+@queue.command("run")
+@click.option("--limit", type=int, help="Stop after this many tasks.")
+@click.option("--lease", "lease_s", type=int, help="Seconds a claim stays valid.")
+@click.pass_context
+def queue_run(ctx: click.Context, limit: int | None, lease_s: int | None) -> None:
+    """Run ready tasks until none remain."""
+
+    def action() -> dict[str, Any]:
+        api = open_api(ctx)
+        try:
+            return api.queue_run(limit=limit, lease_s=lease_s)
+        finally:
+            api.close()
+
+    run("queue.run", action)
+
+
+@queue.command("retry")
+@click.argument("task_id", required=False)
+@click.option("--all-failed", is_flag=True, help="Retry every failed task.")
+@click.option("--keep-attempts", is_flag=True, help="Do not reset the attempt count.")
+@click.pass_context
+def queue_retry(
+    ctx: click.Context, task_id: str | None, all_failed: bool, keep_attempts: bool
+) -> None:
+    """Return failed tasks to pending."""
+    if not task_id and not all_failed:
+        raise click.UsageError("pass a TASK_ID or --all-failed")
+
+    def action() -> dict[str, Any]:
+        api = open_api(ctx)
+        try:
+            return api.queue_retry(
+                task_id=task_id,
+                all_failed=all_failed,
+                reset_attempts=not keep_attempts,
+            )
+        finally:
+            api.close()
+
+    run("queue.retry", action)
+
+
+@queue.command("cancel")
+@click.argument("task_id")
+@click.pass_context
+def queue_cancel(ctx: click.Context, task_id: str) -> None:
+    """Cancel a pending or running task."""
+
+    def action() -> dict[str, Any]:
+        api = open_api(ctx)
+        try:
+            return api.queue_cancel(task_id)
+        finally:
+            api.close()
+
+    run("queue.cancel", action)
+
+
+@queue.command("purge")
+@click.option("--keep-days", type=int, default=7, show_default=True)
+@click.pass_context
+def queue_purge(ctx: click.Context, keep_days: int) -> None:
+    """Drop old finished tasks. Pending and running work is never purged."""
+
+    def action() -> dict[str, Any]:
+        api = open_api(ctx)
+        try:
+            return api.queue_purge(keep_days=keep_days)
+        finally:
+            api.close()
+
+    run("queue.purge", action)
+
+
+@main.command()
+@click.pass_context
+def capabilities(ctx: click.Context) -> None:
+    """Report which optional media dependencies are installed."""
+
+    def action() -> dict[str, Any]:
+        from . import media
+        from .processors import base as processors
+
+        report = media.capability_report()
+        report["processors"] = [
+            {
+                "name": p.name,
+                "cost": p.cost,
+                "version": p.version,
+                "media_types": list(p.media_types),
+                "extensions": list(p.extensions),
+            }
+            for p in sorted(processors.iter_registered(), key=lambda p: p.name)
+        ]
+        return report
+
+    run("capabilities", action)
 
 
 if __name__ == "__main__":  # pragma: no cover

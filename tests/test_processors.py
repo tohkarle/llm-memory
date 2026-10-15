@@ -116,8 +116,7 @@ class TestResolution:
             ("video/mp4", ".mp4", "video"),
             ("application/pdf", ".pdf", "document"),
             (
-                "application/vnd.openxmlformats-officedocument."
-                "wordprocessingml.document",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                 ".docx",
                 "document",
             ),
