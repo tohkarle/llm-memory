@@ -860,3 +860,54 @@ class TestTagsCommand:
 
         _, payload, _ = run(runner, root, "tags", "--include-inactive")
         assert [t["tag"] for t in payload["data"]["tags"]] == ["plaintag"]
+
+    # ----------------------------------------------------------- near misses
+
+    def test_near_misses_do_not_chain_short_tags(self, runner: CliRunner, root: Path) -> None:
+        """`ci`/`ui` and `ui`/`ux` are each one edit apart, and all unrelated.
+
+        Union-find merged them transitively into one group, so the listing
+        advised merging `ci` with `ux`, which share no character.
+        """
+        for tag in ("ci", "cli", "ui", "ux"):
+            create(runner, root, title=f"Short {tag}", tag=tag)
+
+        _, payload, _ = run(runner, root, "tags", "--near-misses")
+        assert payload["data"]["near_misses"] == []
+
+    def test_near_misses_ignore_distance_on_four_char_tags(
+        self, runner: CliRunner, root: Path
+    ) -> None:
+        """Four characters is still too short for one edit to mean drift.
+
+        `code`, `core`, `mode` and `node` are each one edit from the next and
+        are four distinct topics -- the floor has to sit above them.
+        """
+        for tag in ("code", "core", "mode", "node"):
+            create(runner, root, title=f"Four {tag}", tag=tag)
+
+        _, payload, _ = run(runner, root, "tags", "--near-misses")
+        assert payload["data"]["near_misses"] == []
+
+    def test_near_misses_still_group_long_typos(self, runner: CliRunner, root: Path) -> None:
+        """The floor must not cost the real drift: these are five and up."""
+        create(runner, root, title="A", tag="backend")
+        create(runner, root, title="B", tag="backen")
+        create(runner, root, title="C", tag="synk-tasks")
+        create(runner, root, title="D", tag="sync-tasks")
+
+        _, payload, _ = run(runner, root, "tags", "--near-misses")
+        grouped = sorted(
+            sorted(m["value"] for m in g["members"]) for g in payload["data"]["near_misses"]
+        )
+        assert grouped == [["backen", "backend"], ["sync-tasks", "synk-tasks"]]
+
+    def test_short_separator_drift_still_groups(self, runner: CliRunner, root: Path) -> None:
+        """The floor gates the distance rule only; skeletons group at any length."""
+        create(runner, root, title="A", tag="e-2-e")
+        create(runner, root, title="B", tag="e2e")
+
+        _, payload, _ = run(runner, root, "tags", "--near-misses")
+        groups = payload["data"]["near_misses"]
+        assert len(groups) == 1
+        assert sorted(m["value"] for m in groups[0]["members"]) == ["e-2-e", "e2e"]

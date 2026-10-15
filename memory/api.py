@@ -1412,6 +1412,17 @@ def _skeleton(value: str) -> str:
     return value.casefold().replace("-", "").replace("_", "")
 
 
+# Shortest skeleton the one-edit rule is allowed to judge. At four characters
+# a single edit is still a quarter of the tag, and real vocabularies are dense
+# with distinct four-letter tags one edit apart (`code`/`core`/`mode`/`node`,
+# `data`/`date`, `mail`/`main`, `beta`/`meta`), so a floor of four re-creates
+# the chaining it is meant to stop. Five admits none of those while keeping
+# every genuine drift pair, which is longer: `backend`/`backen`,
+# `synctask`/`synctasks`, `sync-tasks`/`synk-tasks`. The cost is `doc`/`docs`,
+# accepted -- silence is better here than confidently advising a bad merge.
+_MIN_EDIT_SKELETON = 5
+
+
 def _within_one_edit(a: str, b: str) -> bool:
     """True when ``a`` and ``b`` differ by one insertion, deletion or swap.
 
@@ -1472,7 +1483,16 @@ def _near_misses(items: list[tuple[str, int]]) -> list[dict[str, Any]]:
 
     for index, value in enumerate(values):
         for other in values[index + 1 :]:
-            if _within_one_edit(_skeleton(value), _skeleton(other)):
+            a, b = _skeleton(value), _skeleton(other)
+            if min(len(a), len(b)) < _MIN_EDIT_SKELETON:
+                # On a short tag one edit is most of the tag, so distance 1 is
+                # no evidence of drift: `ci`/`ui`, `code`/`core`, `data`/`date`
+                # are distinct topics, and union-find would chain them into one
+                # group (`ci`-`ui`-`ux`) and advise merging unrelated
+                # vocabulary. Separator drift is unaffected -- the skeleton
+                # rule above has already grouped it at any length.
+                continue
+            if _within_one_edit(a, b):
                 union(value, other)
 
     groups: dict[str, list[str]] = {}

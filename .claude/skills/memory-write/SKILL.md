@@ -79,7 +79,7 @@ project / domain / lifecycle; `--entity` for the named things themselves.
 - **`mem tags` first; reuse before coining.** Drift is the failure, not
   absence — `synctasks` and `sync-tasks` are two tags, so either filter
   silently misses the other's memories. `mem tags --near-misses` shows splits
-  already there.
+  already there (long tags only — one edit on a short tag is not drift).
 - **`mem tags` hides `secret` memories' tags; `--include-secret` to see them.**
   The slug leaks the subject. Tagging a secret project? Check with the flag
   first, or you coin a duplicate of a tag you cannot see.
