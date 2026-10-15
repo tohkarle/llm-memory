@@ -147,7 +147,7 @@ class ImageProcessor:
         if not raw:
             return {}
         try:
-            from PIL.ExifTags import TAGS  # type: ignore[import-not-found]
+            from PIL.ExifTags import TAGS
         except Exception:
             return {}
 

@@ -16,9 +16,44 @@ dependencies = [
 [project.scripts]
 mem = "mem_launcher:run"
 
+# This package publishes its own processors through the same entry point group
+# third-party processors use. They are also registered directly at import, so
+# discovery is not load-bearing here -- publishing them keeps the contract
+# honest and gives an external package a working example to copy.
+[project.entry-points."memory.processors"]
+text = "memory.processors.text:TextProcessor"
+image = "memory.processors.image:ImageProcessor"
+audio = "memory.processors.audio:AudioProcessor"
+video = "memory.processors.video:VideoProcessor"
+document = "memory.processors.document:DocumentProcessor"
+
 [project.optional-dependencies]
 mcp = ["mcp>=1.2"]
 tokenizer = ["tiktoken>=0.7"]
+
+# Media processing. Every one of these is optional on purpose: the core
+# install must work with none of them present, and the processors degrade to
+# the metadata they can still extract rather than failing. ffmpeg and
+# tesseract are system binaries, not Python packages, so they are not listed
+# here -- `mem capabilities` reports whether they are on PATH.
+media = [
+    "pillow>=10.0",     # image dimensions, EXIF
+    "pypdf>=4.0",       # PDF text and structure
+    "python-docx>=1.1", # docx text and headings
+]
+# Transcription, separated from `media` because it pulls a large model
+# runtime (ctranslate2) that a user who only wants PDF text should not have
+# to download.
+transcription = ["faster-whisper>=1.0"]
+# OCR needs the tesseract binary as well as this wrapper.
+ocr = ["pytesseract>=0.3.10", "pillow>=10.0"]
+all-media = [
+    "pillow>=10.0",
+    "pypdf>=4.0",
+    "python-docx>=1.1",
+    "faster-whisper>=1.0",
+    "pytesseract>=0.3.10",
+]
 dev = [
     "pytest>=8",
     "pytest-cov",
@@ -60,4 +95,16 @@ warn_unreachable = true
 
 [[tool.mypy.overrides]]
 module = "mcp.*"
+ignore_missing_imports = true
+
+# The media extras are optional and several ship no stubs, so a machine
+# without them installed must still typecheck clean.
+[[tool.mypy.overrides]]
+module = [
+    "PIL.*",
+    "pypdf.*",
+    "docx.*",
+    "faster_whisper.*",
+    "pytesseract.*",
+]
 ignore_missing_imports = true

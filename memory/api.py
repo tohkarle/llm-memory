@@ -16,7 +16,7 @@ import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import TracebackType
-from typing import Any, Self
+from typing import TYPE_CHECKING, Any, Self
 
 from . import db, media
 from .context import ContextResult, get_context
@@ -49,6 +49,13 @@ from .search import (
     search,
 )
 from .store import Conflict, NotFound, Store, Tombstoned
+
+if TYPE_CHECKING:  # pragma: no cover
+    from .backup import BackupResult, ExportResult, ImportResult
+    from .cascade import DeletionPlan, DeletionResult
+    from .consolidate import ConsolidationReport
+    from .extract import ExtractionReport
+    from .providers import LLMProvider
 
 #: Fields a caller may patch through ``update``. ``type`` is excluded on
 #: purpose: changing it changes what the memory *is*, which is a supersession,
@@ -1080,6 +1087,145 @@ class MemoryAPI:
         from . import workqueue
 
         return {"removed": workqueue.purge(self.conn, keep_days=keep_days)}
+
+    # ------------------------------------------------------------------ intelligence
+
+    def provider(self) -> LLMProvider | None:
+        """The configured LLM provider, or ``None`` when none is set up.
+
+        ``None`` is the normal state, not a failure: every caller either
+        degrades to a deterministic path or raises with instructions. See
+        :mod:`memory.providers`.
+        """
+        from .providers import load_provider
+
+        return load_provider(self.paths.data)
+
+    def provider_config(self) -> dict[str, Any]:
+        from .providers import read_config
+
+        return read_config(self.paths.data).to_json()
+
+    def consolidate(self, *, use_llm: bool = False, **kwargs: Any) -> ConsolidationReport:
+        """Scan for duplicates, contradictions and stale memories.
+
+        Read-only: it returns proposals naming a verb and its arguments.
+        Nothing is written unless the caller passes them to
+        :meth:`apply_consolidation`.
+        """
+        from . import consolidate as consolidation
+
+        provider = self.provider() if use_llm else None
+        return consolidation.detect(self, provider=provider, **kwargs)
+
+    def apply_consolidation(
+        self, report: ConsolidationReport, *, kinds: list[str] | None = None
+    ) -> ConsolidationReport:
+        from . import consolidate as consolidation
+
+        self._require_writable()
+        return consolidation.apply_all(self, report, kinds=kinds)
+
+    def extract(
+        self,
+        text: str,
+        *,
+        source: SourceRef,
+        use_llm: bool = False,
+        check_duplicates: bool = True,
+        **kwargs: Any,
+    ) -> ExtractionReport:
+        """Propose candidate memories from source material. Writes nothing."""
+        from . import extract as extraction
+
+        provider = self.provider() if use_llm else None
+        report = extraction.from_text(text, source=source, provider=provider, **kwargs)
+        if check_duplicates:
+            extraction.annotate_duplicates(self, report)
+        return report
+
+    def extract_suggestions(
+        self,
+        suggestions: list[dict[str, Any]],
+        *,
+        source: SourceRef | None = None,
+        check_duplicates: bool = True,
+    ) -> ExtractionReport:
+        """Turn ``ProcessResult.memory_suggestions`` into candidates."""
+        from . import extract as extraction
+
+        report = extraction.from_suggestions(suggestions, source=source)
+        if check_duplicates:
+            extraction.annotate_duplicates(self, report)
+        return report
+
+    def commit_extraction(self, report: ExtractionReport, **kwargs: Any) -> ExtractionReport:
+        from . import extract as extraction
+
+        self._require_writable()
+        return extraction.commit(self, report, **kwargs)
+
+    # ------------------------------------------------------------------ cascade
+
+    def plan_source_deletion(self, source_ref: str, **kwargs: Any) -> DeletionPlan:
+        """The full blast radius of deleting a source. Read-only."""
+        from . import cascade
+
+        return cascade.plan_deletion(self, source_ref, **kwargs)
+
+    def delete_source(self, source_ref: str, **kwargs: Any) -> DeletionResult:
+        from . import cascade
+
+        self._require_writable()
+        return cascade.delete_source(self, source_ref, **kwargs)
+
+    def orphaned_memories(self) -> list[dict[str, Any]]:
+        from . import cascade
+
+        return cascade.orphaned_memories(self)
+
+    # ------------------------------------------------------------------ backup
+
+    def backup(self, **kwargs: Any) -> BackupResult:
+        from . import backup as backups
+
+        self._require_writable()
+        return backups.backup(self, **kwargs)
+
+    def list_backups(self, **kwargs: Any) -> list[dict[str, Any]]:
+        from . import backup as backups
+
+        return backups.list_backups(self.paths, **kwargs)
+
+    def prune_backups(self, **kwargs: Any) -> dict[str, Any]:
+        from . import backup as backups
+
+        return backups.prune(self.paths, **kwargs)
+
+    def export_memories(
+        self, *, format: str = "jsonl", out: Path | None = None, **kw: Any
+    ) -> ExportResult:
+        from . import backup as backups
+
+        if format == "jsonl":
+            return backups.export_jsonl(self, out=out, **kw)
+        if format == "markdown":
+            if out is None:
+                raise ValueError("the markdown format writes a directory; pass out=")
+            return backups.export_markdown_dir(self, out, **kw)
+        raise ValueError(f"unknown export format: {format}")
+
+    def import_memories(
+        self, source: Path | str, *, format: str = "jsonl", **kw: Any
+    ) -> ImportResult:
+        from . import backup as backups
+
+        self._require_writable()
+        if format == "jsonl":
+            return backups.import_jsonl(self, source, **kw)
+        if format == "markdown":
+            return backups.import_markdown_dir(self, Path(source), **kw)
+        raise ValueError(f"unknown import format: {format}")
 
     # ------------------------------------------------------------------ maintenance
 

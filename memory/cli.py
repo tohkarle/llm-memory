@@ -1427,5 +1427,489 @@ def capabilities(ctx: click.Context) -> None:
     run("capabilities", action)
 
 
+# ---------------------------------------------------------------- intelligence
+
+
+@main.group()
+def provider() -> None:
+    """Inspect and configure the optional LLM provider."""
+
+
+@provider.command("show")
+@click.pass_context
+def provider_show(ctx: click.Context) -> None:
+    """Report the configured provider, if any."""
+
+    def action() -> dict[str, Any]:
+        api = open_api(ctx, read_only=True)
+        try:
+            payload: dict[str, Any] = {"config": api.provider_config()}
+            instance = api.provider()
+            payload["configured"] = instance is not None
+            payload["provider"] = instance.describe() if instance is not None else None
+            if instance is None:
+                payload["note"] = (
+                    "No provider is configured. Consolidation and extraction still "
+                    "work on their deterministic paths; `--llm` would fail with "
+                    "instructions."
+                )
+            return payload
+        finally:
+            api.close()
+
+    run("provider.show", action)
+
+
+@provider.command("set")
+@click.option("--provider", "name", required=True, help="none | echo | openai-compatible")
+@click.option("--model")
+@click.option("--base-url", help="Required for openai-compatible, e.g. http://localhost:11434/v1")
+@click.option("--api-key", help="Stored in data/config/llm.json. Omit for a local runtime.")
+@click.option("--timeout", type=float, default=60.0, show_default=True)
+@click.pass_context
+def provider_set(
+    ctx: click.Context,
+    name: str,
+    model: str | None,
+    base_url: str | None,
+    api_key: str | None,
+    timeout: float,
+) -> None:
+    """Write the provider config. No network call is made."""
+
+    def action() -> dict[str, Any]:
+        from .providers import ProviderConfig, load_provider, write_config
+
+        api = open_api(ctx)
+        try:
+            config = ProviderConfig(
+                provider=name,
+                model=model,
+                base_url=base_url,
+                api_key=api_key,
+                timeout=timeout,
+            )
+            # Build it once so a bad combination fails here, with a clear
+            # message, rather than on first use inside another command.
+            instance = load_provider(api.paths.data, config=config)
+            path = write_config(api.paths.data, config)
+            return {
+                "path": api.paths.rel(path),
+                "config": config.to_json(),
+                "provider": instance.describe() if instance is not None else None,
+            }
+        finally:
+            api.close()
+
+    run("provider.set", action)
+
+
+@main.command()
+@click.option("--type", "types", multiple=True, type=TYPE_CHOICE)
+@click.option("--tag", "tags", multiple=True)
+@click.option("--id", "memory_ids", multiple=True, help="Restrict to these memories.")
+@click.option("--threshold", type=click.FloatRange(0, 1), help="Duplicate cutoff.")
+@click.option("--near-threshold", type=click.FloatRange(0, 1))
+@click.option("--no-stale", is_flag=True, help="Skip review_after/valid_until findings.")
+@click.option("--llm", "use_llm", is_flag=True, help="Adjudicate borderline pairs with a model.")
+@click.option("--limit", type=int, default=50, show_default=True)
+@click.option("--apply", "apply_proposals", is_flag=True, help="Execute duplicate merges.")
+@click.option(
+    "--kind",
+    "kinds",
+    multiple=True,
+    type=click.Choice(["duplicate", "contradiction"]),
+    help="With --apply: which kinds to execute. Default: duplicate only.",
+)
+@click.option("--yes", is_flag=True, help="Required for --apply.")
+@click.pass_context
+def consolidate(
+    ctx: click.Context,
+    types: tuple[str, ...],
+    tags: tuple[str, ...],
+    memory_ids: tuple[str, ...],
+    threshold: float | None,
+    near_threshold: float | None,
+    no_stale: bool,
+    use_llm: bool,
+    limit: int,
+    apply_proposals: bool,
+    kinds: tuple[str, ...],
+    yes: bool,
+) -> None:
+    """Find duplicates, contradictions and stale memories.
+
+    Reports proposals by default and writes nothing. Each proposal names the
+    verb to run and its arguments, so you can execute them selectively.
+    """
+
+    def action() -> dict[str, Any]:
+        if apply_proposals and not yes:
+            raise CliError(
+                "confirmation_required",
+                "--apply merges memories; pass --yes to confirm",
+                EXIT_VALIDATION,
+            )
+        from .consolidate import DUPLICATE_THRESHOLD, NEAR_THRESHOLD
+
+        api = open_api(ctx, read_only=not apply_proposals)
+        try:
+            report = api.consolidate(
+                use_llm=use_llm,
+                types=list(types) or None,
+                tags=list(tags) or None,
+                memory_ids=list(memory_ids) or None,
+                threshold=threshold if threshold is not None else DUPLICATE_THRESHOLD,
+                near_threshold=(near_threshold if near_threshold is not None else NEAR_THRESHOLD),
+                include_stale=not no_stale,
+                limit=limit,
+            )
+            if apply_proposals:
+                report = api.apply_consolidation(report, kinds=list(kinds) or None)
+            return report.to_json()
+        finally:
+            api.close()
+
+    run("consolidate", action)
+
+
+@main.command()
+@click.option("--file", "path", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--text")
+@click.option("--stdin", "use_stdin", is_flag=True)
+@click.option(
+    "--source",
+    "source_spec",
+    required=True,
+    metavar="KIND:REF[:LOCATOR]",
+    help="Provenance for every candidate. Required: a memory must cite its origin.",
+)
+@click.option("--llm", "use_llm", is_flag=True, help="Use the configured model.")
+@click.option("--no-fallback", is_flag=True, help="With --llm: do not fall back to patterns.")
+@click.option("--limit", type=int, default=20, show_default=True)
+@click.option("--commit", "do_commit", is_flag=True, help="Create the candidates.")
+@click.option("--min-confidence", type=click.FloatRange(0, 1), default=0.0, show_default=True)
+@click.option("--keep-duplicates", is_flag=True, help="With --commit: create near-duplicates too.")
+@click.pass_context
+def extract(
+    ctx: click.Context,
+    path: Path | None,
+    text: str | None,
+    use_stdin: bool,
+    source_spec: str,
+    use_llm: bool,
+    no_fallback: bool,
+    limit: int,
+    do_commit: bool,
+    min_confidence: float,
+    keep_duplicates: bool,
+) -> None:
+    """Propose memories from source material.
+
+    Prints candidates by default; `--commit` creates them. Without `--llm`
+    this runs a conservative pattern matcher over explicit statements.
+    """
+
+    def action() -> dict[str, Any]:
+        sources = [path is not None, text is not None, use_stdin]
+        if sum(sources) != 1:
+            raise CliError(
+                "validation",
+                "pass exactly one of --file, --text, --stdin",
+                EXIT_VALIDATION,
+            )
+        material = (
+            path.read_text(encoding="utf-8")
+            if path is not None
+            else (text if text is not None else sys.stdin.read())
+        )
+        api = open_api(ctx, read_only=not do_commit)
+        try:
+            report = api.extract(
+                material or "",
+                source=parse_source(source_spec),
+                use_llm=use_llm,
+                limit=limit,
+                fallback=not no_fallback,
+            )
+            if do_commit:
+                report = api.commit_extraction(
+                    report,
+                    min_confidence=min_confidence,
+                    skip_duplicates=not keep_duplicates,
+                )
+            return report.to_json()
+        finally:
+            api.close()
+
+    run("extract", action)
+
+
+# ---------------------------------------------------------------- sources
+
+
+@main.group()
+def source() -> None:
+    """Manage source material and what depends on it."""
+
+
+@source.command("plan-delete")
+@click.argument("source_ref")
+@click.option("--kind", type=click.Choice([k.value for k in SourceKind]))
+@click.option(
+    "--memories",
+    "memory_policy",
+    type=click.Choice(["orphan", "delete", "purge", "keep"]),
+    default="orphan",
+    show_default=True,
+)
+@click.pass_context
+def source_plan_delete(
+    ctx: click.Context, source_ref: str, kind: str | None, memory_policy: str
+) -> None:
+    """Show everything deleting a source would touch. Writes nothing."""
+
+    def action() -> dict[str, Any]:
+        api = open_api(ctx, read_only=True)
+        try:
+            plan = api.plan_source_deletion(source_ref, kind=kind, memory_policy=memory_policy)
+            return plan.to_json()
+        finally:
+            api.close()
+
+    run("source.plan-delete", action)
+
+
+@source.command("delete")
+@click.argument("source_ref")
+@click.option("--kind", type=click.Choice([k.value for k in SourceKind]))
+@click.option(
+    "--memories",
+    "memory_policy",
+    type=click.Choice(["orphan", "delete", "purge", "keep"]),
+    default="orphan",
+    show_default=True,
+    help="orphan keeps memories and drops the dangling citation.",
+)
+@click.option("--keep-raw", is_flag=True, help="Remove derived state but keep the original file.")
+@click.option("--reason")
+@click.option("--yes", is_flag=True, help="Required: this removes derived files.")
+@click.pass_context
+def source_delete(
+    ctx: click.Context,
+    source_ref: str,
+    kind: str | None,
+    memory_policy: str,
+    keep_raw: bool,
+    reason: str | None,
+    yes: bool,
+) -> None:
+    """Delete a source and everything derived from it."""
+
+    def action() -> dict[str, Any]:
+        api = open_api(ctx, read_only=not yes)
+        try:
+            if not yes:
+                plan = api.plan_source_deletion(source_ref, kind=kind, memory_policy=memory_policy)
+                return {"dry_run": True, "plan": plan.to_json(), "hint": "pass --yes to execute"}
+            result = api.delete_source(
+                source_ref,
+                kind=kind,
+                memory_policy=memory_policy,
+                remove_raw=not keep_raw,
+                reason=reason,
+            )
+            return result.to_json()
+        finally:
+            api.close()
+
+    run("source.delete", action)
+
+
+@source.command("list")
+@click.option("--limit", type=int, default=50, show_default=True)
+@click.pass_context
+def source_list(ctx: click.Context, limit: int) -> None:
+    """Sources memories cite, with how many cite each."""
+
+    def action() -> dict[str, Any]:
+        api = open_api(ctx, read_only=True)
+        try:
+            rows = [
+                dict(r)
+                for r in api.conn.execute(
+                    "SELECT s.id, s.kind, s.ref, s.captured_at, "
+                    "(SELECT count(*) FROM memory_sources ms WHERE ms.source_id = s.id) "
+                    "AS memories FROM sources s ORDER BY memories DESC, s.ref LIMIT ?",
+                    (limit,),
+                )
+            ]
+            return {"total": len(rows), "sources": rows}
+        finally:
+            api.close()
+
+    run("source.list", action)
+
+
+@source.command("orphans")
+@click.pass_context
+def source_orphans(ctx: click.Context) -> None:
+    """Memories whose provenance was removed and not re-established."""
+
+    def action() -> dict[str, Any]:
+        api = open_api(ctx, read_only=True)
+        try:
+            rows = api.orphaned_memories()
+            return {"total": len(rows), "memories": rows}
+        finally:
+            api.close()
+
+    run("source.orphans", action)
+
+
+# ---------------------------------------------------------------- backup
+
+
+@main.group()
+def backup() -> None:
+    """Archive, restore, and apply retention."""
+
+
+@backup.command("create")
+@click.option("--out", type=click.Path(path_type=Path), help="File or directory.")
+@click.option("--label", help="A short name recorded in the filename and manifest.")
+@click.option("--no-compress", is_flag=True)
+@click.pass_context
+def backup_create(
+    ctx: click.Context, out: Path | None, label: str | None, no_compress: bool
+) -> None:
+    """Archive data/ (excluding the rebuildable index)."""
+
+    def action() -> dict[str, Any]:
+        api = open_api(ctx)
+        try:
+            return api.backup(dest=out, label=label, compress=not no_compress).to_json()
+        finally:
+            api.close()
+
+    run("backup.create", action)
+
+
+@backup.command("list")
+@click.option("--dir", "directory", type=click.Path(path_type=Path))
+@click.pass_context
+def backup_list(ctx: click.Context, directory: Path | None) -> None:
+    """Backups on disk, newest first."""
+
+    def action() -> dict[str, Any]:
+        api = open_api(ctx, read_only=True)
+        try:
+            rows = api.list_backups(directory=directory)
+            return {"total": len(rows), "backups": rows}
+        finally:
+            api.close()
+
+    run("backup.list", action)
+
+
+@backup.command("prune")
+@click.option("--keep-days", type=int, default=90, show_default=True)
+@click.option("--keep-count", type=int, default=10, show_default=True)
+@click.option("--dir", "directory", type=click.Path(path_type=Path))
+@click.option("--yes", is_flag=True, help="Without this, reports what it would remove.")
+@click.pass_context
+def backup_prune(
+    ctx: click.Context, keep_days: int, keep_count: int, directory: Path | None, yes: bool
+) -> None:
+    """Apply the retention policy. The newest backup is always kept."""
+
+    def action() -> dict[str, Any]:
+        api = open_api(ctx, read_only=True)
+        try:
+            return api.prune_backups(
+                keep_days=keep_days,
+                keep_count=keep_count,
+                directory=directory,
+                dry_run=not yes,
+            )
+        finally:
+            api.close()
+
+    run("backup.prune", action)
+
+
+@backup.command("show")
+@click.argument("archive", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+def backup_show(archive: Path) -> None:
+    """Read an archive's manifest without extracting it."""
+
+    def action() -> dict[str, Any]:
+        from .backup import read_manifest
+
+        return {"archive": str(archive), "manifest": read_manifest(archive)}
+
+    run("backup.show", action)
+
+
+@backup.command("restore")
+@click.argument("archive", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--to", "target", type=click.Path(path_type=Path), required=True)
+@click.option("--overwrite", is_flag=True, help="Replace a non-empty data/ directory.")
+@click.option("--rebuild/--no-rebuild", default=True, show_default=True)
+@click.pass_context
+def backup_restore(
+    ctx: click.Context, archive: Path, target: Path, overwrite: bool, rebuild: bool
+) -> None:
+    """Extract an archive into a root and rebuild its index."""
+
+    def action() -> dict[str, Any]:
+        from .backup import restore as restore_archive
+
+        report = restore_archive(archive, target, overwrite=overwrite)
+        if rebuild:
+            api = MemoryAPI(target)
+            api.open()
+            try:
+                report["rebuild"] = api.rebuild_index(verify_after=True)
+            finally:
+                api.close()
+        return report
+
+    run("backup.restore", action)
+
+
+@main.command("import")
+@click.argument("source_path", type=click.Path(exists=True, path_type=Path))
+@click.option(
+    "--format",
+    "input_format",
+    type=click.Choice(["jsonl", "markdown"]),
+    default="jsonl",
+    show_default=True,
+)
+@click.option(
+    "--force-recreate",
+    is_flag=True,
+    help="Override tombstones. Only on an explicit request: it undoes a deletion.",
+)
+@click.pass_context
+def import_memories(
+    ctx: click.Context, source_path: Path, input_format: str, force_recreate: bool
+) -> None:
+    """Import memories from an export. Additive; will not resurrect deletions."""
+
+    def action() -> dict[str, Any]:
+        api = open_api(ctx)
+        try:
+            result = api.import_memories(
+                source_path, format=input_format, force_recreate=force_recreate
+            )
+            return result.to_json()
+        finally:
+            api.close()
+
+    run("import", action)
+
+
 if __name__ == "__main__":  # pragma: no cover
     main()

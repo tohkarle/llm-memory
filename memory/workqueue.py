@@ -492,7 +492,15 @@ def drain(
             continue
         complete(conn, task.id, result=result)
         done.append(task.id)
-    return {"processed": processed, "done": done, "failed": failed, **stats(conn)}
+    # `completed`/`errors` rather than `done`/`failed`: stats() reports queue
+    # totals under those names, and a merged dict would silently shadow this
+    # run's per-task detail with a count.
+    return {
+        "processed": processed,
+        "completed": done,
+        "errors": failed,
+        "stats": stats(conn),
+    }
 
 
 def iter_ready(conn: sqlite3.Connection) -> Iterator[Task]:
