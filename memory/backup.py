@@ -302,9 +302,18 @@ def list_backups(paths: Paths, *, directory: Path | None = None) -> list[dict[st
                 "name": path.name,
                 "bytes": stat.st_size,
                 "modified_at": fmt_ts(datetime.fromtimestamp(stat.st_mtime, UTC)),
+                "_mtime": stat.st_mtime,
             }
         )
-    return sorted(out, key=lambda entry: str(entry["name"]), reverse=True)
+    # Ordered by mtime, not by name. "Newest first" is a claim about time, and
+    # :func:`prune` relies on it to decide what survives -- a filename stamp
+    # disagrees with the mtime as soon as an archive is labelled, copied,
+    # restored, or synced, and trusting the name there deletes the newest
+    # backup. The name only breaks ties, for a stable order.
+    out.sort(key=lambda entry: (-float(entry["_mtime"]), str(entry["name"])))
+    for entry in out:
+        del entry["_mtime"]
+    return out
 
 
 def read_manifest(archive: Path) -> dict[str, Any]:
@@ -370,7 +379,8 @@ def prune(
         modified = parse_ts(entry["modified_at"])
         too_old = modified < cutoff
         too_many = position >= keep_count
-        # position 0 is the newest; it survives unconditionally.
+        # position 0 is the newest by mtime -- `list_backups` guarantees that
+        # ordering -- and it survives unconditionally.
         if position > 0 and (too_old or too_many):
             freed += int(entry["bytes"])
             removed.append(str(entry["path"]))

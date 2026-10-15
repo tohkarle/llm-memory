@@ -132,6 +132,7 @@ mem export --out mem.jsonl        &&  mem import mem.jsonl
 mem backup prune --keep-days 90 --keep-count 10 --yes
 ```
 
+`prune` keeps the newest archive by mtime unconditionally, labels and all.
 Archives exclude the index (rebuildable) and always include tombstones.
 Import is additive and **cannot resurrect a purged memory** — exporting first
 is not a way around a deletion. Before any bulk operation, back up.

@@ -13,6 +13,7 @@ The properties worth the most here:
 from __future__ import annotations
 
 import json
+import os
 import tarfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -191,10 +192,23 @@ def test_list_backups_is_newest_first(api: MemoryAPI) -> None:
     seed_corpus(api)
     base = backup_dir(api.paths)
     base.mkdir(parents=True, exist_ok=True)
-    for stamp in ("20260101T000000Z", "20260301T000000Z", "20260201T000000Z"):
-        (base / f"memory-backup-{stamp}.tar.gz").write_bytes(b"x")
+    # Ages chosen so the write order, the name order, and the time order all
+    # differ: only a real mtime sort puts the 1-day-old archive first.
+    for stamp, age in (
+        ("20260101T000000Z", 10),
+        ("20260301T000000Z", 30),
+        ("20260201T000000Z", 1),
+    ):
+        path = base / f"memory-backup-{stamp}.tar.gz"
+        path.write_bytes(b"x")
+        when = (datetime.now(UTC) - timedelta(days=age)).timestamp()
+        os.utime(path, (when, when))
     names = [entry["name"] for entry in list_backups(api.paths)]
-    assert names[0].startswith("memory-backup-20260301")
+    assert names == [
+        "memory-backup-20260201T000000Z.tar.gz",
+        "memory-backup-20260101T000000Z.tar.gz",
+        "memory-backup-20260301T000000Z.tar.gz",
+    ]
 
 
 def test_list_backups_ignores_unrelated_files(api: MemoryAPI) -> None:
@@ -233,8 +247,6 @@ def test_read_manifest_rejects_a_future_archive_version(tmp_path: Path) -> None:
 
 
 def _fake_backups(api: MemoryAPI, ages_in_days: list[int]) -> None:
-    import os
-
     base = backup_dir(api.paths)
     base.mkdir(parents=True, exist_ok=True)
     now = datetime.now(UTC)
@@ -273,6 +285,57 @@ def test_prune_always_keeps_the_newest(api: MemoryAPI) -> None:
     remaining = list_backups(api.paths)
     assert len(remaining) == 1
     assert report["kept"] == [remaining[0]["path"]]
+
+
+def _backup_at(api: MemoryAPI, name: str, age_in_days: float) -> Path:
+    """An archive whose *filename* is free to disagree with its mtime.
+
+    Deliberately not derived from the mtime, unlike :func:`_fake_backups`: a
+    fixture that computes the name from the time can never express the
+    divergence that retention actually has to survive (an archive copied,
+    restored, synced, or labelled), so an assertion over it cannot fail.
+    """
+    base = backup_dir(api.paths)
+    base.mkdir(parents=True, exist_ok=True)
+    path = base / name
+    path.write_bytes(b"x" * 100)
+    stamp = (datetime.now(UTC) - timedelta(days=age_in_days)).timestamp()
+    os.utime(path, (stamp, stamp))
+    return path
+
+
+def test_list_backups_orders_by_mtime_not_filename(api: MemoryAPI) -> None:
+    """Newest-first is a claim about time, and nothing else can stand in."""
+    _backup_at(api, "memory-backup-20250101T000000Z-alpha.tar.gz", 0)
+    _backup_at(api, "memory-backup-20260101T000000Z-zulu.tar.gz", 400)
+    assert [entry["name"] for entry in list_backups(api.paths)] == [
+        "memory-backup-20250101T000000Z-alpha.tar.gz",
+        "memory-backup-20260101T000000Z-zulu.tar.gz",
+    ]
+
+
+def test_prune_keeps_the_newest_when_the_filename_stamp_disagrees(api: MemoryAPI) -> None:
+    """The newest backup by *mtime* survives even if it sorts last by name.
+
+    A label, a restored archive, or a `.tar` beside a `.tar.gz` all make the
+    filename order diverge from the time order; trusting the name here
+    deletes the only current backup and keeps a year-old one.
+    """
+    newest = _backup_at(api, "memory-backup-20250101T000000Z-alpha.tar.gz", 0)
+    oldest = _backup_at(api, "memory-backup-20260101T000000Z-zulu.tar.gz", 400)
+    report = prune(api.paths, keep_days=90, keep_count=10, dry_run=False)
+    assert newest.exists(), "prune deleted the newest backup"
+    assert not oldest.exists()
+    assert report["removed"] == [str(oldest)]
+    assert report["kept"] == [str(newest)]
+
+
+def test_prune_keeps_the_newest_by_mtime_under_a_count_bound(api: MemoryAPI) -> None:
+    newest = _backup_at(api, "memory-backup-20200101T000000Z-aaa.tar.gz", 0)
+    older = _backup_at(api, "memory-backup-20990101T000000Z-zzz.tar.gz", 5)
+    prune(api.paths, keep_days=3650, keep_count=1, dry_run=False)
+    assert newest.exists()
+    assert not older.exists()
 
 
 def test_prune_refuses_a_policy_that_keeps_nothing(api: MemoryAPI) -> None:
