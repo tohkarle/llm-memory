@@ -777,7 +777,21 @@ class TestTagsCommand:
             "tags": [],
         }
 
-    @pytest.mark.parametrize(("flag", "value"), [("--limit", "0"), ("--min-count", "0")])
+    @pytest.mark.parametrize(
+        ("flag", "value"),
+        [
+            ("--limit", "0"),
+            ("--min-count", "0"),
+            ("--limit", "-1"),
+            ("--min-count", "-1"),
+            # Wider than SQLite's signed 64-bit bind parameter: this reached
+            # the driver and came back as an `internal` OverflowError (exit 70).
+            ("--limit", "99999999999999999999"),
+            ("--min-count", "99999999999999999999"),
+            ("--limit", str(2**63)),
+            ("--min-count", str(2**63)),
+        ],
+    )
     def test_rejects_nonsense_bounds(
         self, runner: CliRunner, root: Path, flag: str, value: str
     ) -> None:

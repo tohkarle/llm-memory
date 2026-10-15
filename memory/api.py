@@ -1286,10 +1286,8 @@ class MemoryAPI:
         """
         if facet not in ("tag", "entity"):
             raise ValueError(f"facet: expected 'tag' or 'entity', got {facet!r}")
-        if limit < 1:
-            raise ValueError(f"limit: must be >= 1, got {limit}")
-        if min_count < 1:
-            raise ValueError(f"min_count: must be >= 1, got {min_count}")
+        _check_sqlite_int("limit", limit)
+        _check_sqlite_int("min_count", min_count)
 
         table = "memory_tags" if facet == "tag" else "memory_entities"
         column = facet
@@ -1398,6 +1396,19 @@ class MemoryAPI:
 
 
 # ---------------------------------------------------------------- helpers
+
+# SQLite binds parameters as signed 64-bit integers; anything wider raises
+# OverflowError from the driver, which surfaces as an `internal` error rather
+# than telling the caller their number was out of range.
+_SQLITE_INT_MAX = 2**63 - 1
+
+
+def _check_sqlite_int(name: str, value: int) -> None:
+    """Reject a count that is below one or too wide for a bound parameter."""
+    if value < 1:
+        raise ValueError(f"{name}: must be >= 1, got {value}")
+    if value > _SQLITE_INT_MAX:
+        raise ValueError(f"{name}: must be <= {_SQLITE_INT_MAX}, got {value}")
 
 
 def _skeleton(value: str) -> str:
