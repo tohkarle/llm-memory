@@ -1379,7 +1379,21 @@ def queue_cancel(ctx: click.Context, task_id: str) -> None:
     def action() -> dict[str, Any]:
         api = open_api(ctx)
         try:
-            return api.queue_cancel(task_id)
+            result = api.queue_cancel(task_id)
+            if not result["cancelled"]:
+                # A typo'd id must not read as a successful cancel. Only
+                # pending and running tasks are cancellable, so say which it
+                # was rather than claiming the task does not exist.
+                from . import workqueue
+
+                existing = workqueue.get(api.conn, task_id)
+                detail = (
+                    f"task {task_id} is {existing.status}, not cancellable"
+                    if existing is not None
+                    else f"no task {task_id}"
+                )
+                raise CliError("not_found", detail, EXIT_NOT_FOUND)
+            return result
         finally:
             api.close()
 

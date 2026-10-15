@@ -546,3 +546,36 @@ class TestBodyInput:
             ],
         )
         assert result.exit_code != 0
+
+
+class TestQueueCancelExitCode:
+    """A typo'd task id must not read as a successful cancel.
+
+    `reprocess` and `segment get` both answer an unknown id with not_found and
+    exit 1; `queue cancel` answered ok:true with "cancelled": false, which is
+    indistinguishable from success without parsing the payload.
+    """
+
+    def test_unknown_task_is_not_found(self, runner: CliRunner, root: Path) -> None:
+        code, payload, _ = run(runner, root, "queue", "cancel", "nosuchtask")
+        assert code == EXIT_NOT_FOUND
+        assert payload["ok"] is False
+        assert payload["error"]["code"] == "not_found"
+
+    def test_cancelling_a_real_task_still_succeeds(
+        self, runner: CliRunner, root: Path, tmp_path: Path
+    ) -> None:
+        from tests.test_ingestion import wav
+
+        code, payload, _ = run(runner, root, "ingest", str(wav(tmp_path)))
+        assert code == 0
+        task_id = str(payload["data"]["queued_task"])
+
+        code, payload, _ = run(runner, root, "queue", "cancel", task_id)
+        assert code == 0
+        assert payload["data"]["cancelled"] is True
+
+        # A second cancel is no longer cancellable, and says so.
+        code, payload, _ = run(runner, root, "queue", "cancel", task_id)
+        assert code == EXIT_NOT_FOUND
+        assert "cancelled" in payload["error"]["message"]
