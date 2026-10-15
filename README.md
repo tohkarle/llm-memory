@@ -9,18 +9,35 @@ relationships — delete `data/index/memory.sqlite` at any time and run `mem reb
 ## Quick start
 
 ```bash
-uv sync --extra dev
-uv run python -m memory init
-uv run python -m memory create --type preference --title "Prefers uv over pip" \
-  --body "Uses uv for all Python projects." --profile --tag tooling
-uv run python -m memory search "uv"
-uv run python -m memory context "python tooling" --budget 800 --format markdown
-uv run python -m memory doctor
+uv sync --extra dev        # dependencies and test tooling
+uv pip install .           # installs the `mem` command
 ```
 
-Installed non-editable (`uv pip install .`), the same commands are available
-as `mem`. Under an editable install, prefer `python -m memory`: the console
-script relies on a `.pth` path hook that some environments do not honor.
+```bash
+mem init
+mem create --type preference --title "Prefers uv over pip" \
+  --body "Uses uv for all Python projects." --profile --tag tooling
+mem search "uv"
+mem context "python tooling" --budget 800 --format markdown
+mem doctor
+```
+
+Set `MEMORY_ROOT`, or pass `--root PATH`, to choose the data directory.
+
+### If `mem` reports "No module named 'memory'"
+
+`uv sync` installs this project in editable mode, which relies on a `.pth`
+path hook in site-packages. On macOS, installers may write that file with the
+`UF_HIDDEN` filesystem flag, and CPython 3.12+ skips hidden `.pth` files
+outright — so the package imports fine inside the project directory, where
+the CWD is already on the path, but the installed `mem` script fails
+anywhere else.
+
+`uv pip install .` (above) avoids the hook by installing real files, and
+`mem doctor` reports `install.warning` when it detects the condition. Within
+the project you can always use `uv run python -m memory …` instead. Note that
+a later `uv sync` reverts to editable mode and undoes this; re-run
+`uv pip install .` if `mem` stops resolving.
 
 ## How agents use it
 

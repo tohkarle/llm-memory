@@ -974,6 +974,7 @@ class MemoryAPI:
         return {
             "root": str(self.paths.root),
             "python": sys.version.split()[0],
+            "install": _install_health(),
             "sqlite": sqlite3.sqlite_version,
             "fts5": db.has_fts5(self.conn),
             "schema_version": db.schema_version(self.conn),
@@ -985,6 +986,47 @@ class MemoryAPI:
 
 
 # ---------------------------------------------------------------- helpers
+
+
+def _install_health() -> dict[str, Any]:
+    """Report whether this package is importable outside its own directory.
+
+    An editable install normally works via a ``.pth`` path hook. Installers
+    on macOS may write that file with the ``UF_HIDDEN`` flag, which CPython
+    >= 3.12 skips, so the package imports only when the project directory
+    happens to be on the path -- the installed console script then fails
+    everywhere else. Surfacing it here turns a confusing ImportError into a
+    diagnosis.
+    """
+    import sys
+
+    import memory
+
+    package_dir = Path(memory.__file__).resolve().parent
+    site_dirs = [Path(p) for p in sys.path if p.endswith("site-packages")]
+    installed = any(package_dir.is_relative_to(d) for d in site_dirs)
+
+    skipped: list[str] = []
+    for site_dir in site_dirs:
+        for pth in site_dir.glob("*.pth"):
+            try:
+                flags = pth.stat().st_flags
+            except (AttributeError, OSError):
+                continue
+            if flags & 0x8000:  # UF_HIDDEN
+                skipped.append(pth.name)
+
+    health: dict[str, Any] = {
+        "mode": "regular" if installed else "editable",
+        "package_dir": str(package_dir),
+    }
+    if not installed and skipped:
+        health["warning"] = (
+            "editable install path hook is hidden and will be skipped by this "
+            f"Python ({', '.join(sorted(skipped))}); the `mem` console script "
+            "will fail outside the project directory. Fix: uv pip install ."
+        )
+    return health
 
 
 def _build_memory(
