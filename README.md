@@ -19,6 +19,8 @@ mem create --type preference --title "Prefers uv over pip" \
   --body "Uses uv for all Python projects." --profile --tag tooling
 mem search "uv"
 mem context "python tooling" --budget 800 --format markdown
+mem ingest ./some-notes.md
+mem segment search "packaging"
 mem doctor
 ```
 
@@ -38,6 +40,74 @@ anywhere else.
 the project you can always use `uv run python -m memory …` instead. Note that
 a later `uv sync` reverts to editable mode and undoes this; re-run
 `uv pip install .` if `mem` stops resolving.
+
+## Multimodal ingestion
+
+`mem ingest` imports a file, derives searchable text from it, and indexes
+that text as **segments** — spans that carry the locator a citation needs.
+
+```bash
+mem ingest ./paper.pdf --tag research       # page-numbered segments
+mem ingest ./talk.mp4                       # transcript + keyframes (deferred)
+mem ingest ./notes/ --recursive
+mem segment search "pricing tiers"          # search inside ingested media
+mem capabilities                            # what optional tooling is present
+```
+
+Type detection reads magic numbers rather than trusting the extension, so a
+`.txt` that is really a PDF reaches the right processor. `--param KEY=VALUE`
+tunes one (`ocr=false`, `model=small`, `keyframe_interval_s=10`).
+
+| Processor | Extracts | Locator on each segment |
+| --- | --- | --- |
+| text | Markdown, plain text, CSV, JSON | — |
+| document | PDF and docx text | `page`, or `meta.heading` for docx |
+| image | dimensions, EXIF, optional OCR | — |
+| audio | timestamped transcript | `start_ms`, `end_ms` |
+| video | transcript from the audio track, keyframes | `start_ms`, `end_ms` |
+
+**Originals are never modified.** Everything derived is written under
+`data/derived/`, and each derived file embeds its own cache key, so
+`mem rebuild` reconstructs the segment and derivation tables from the
+filesystem alone — the same guarantee memories have.
+
+### Cheap now, expensive later
+
+Text, documents and images are processed inline. Transcription is not: a long
+recording would block the command that imported it, so audio and video are
+queued and `ingest` returns `status: "queued"`.
+
+```bash
+mem queue list                    # what is outstanding, failures first
+mem queue run                     # drain ready work
+mem queue retry --all-failed      # after installing a missing extra
+```
+
+The queue is SQLite-backed and survives process death. A claim takes a
+*lease*, not a lock, so a worker killed mid-task has its work reclaimed once
+the lease expires instead of being stranded; attempts are counted when the
+task is claimed, so a crash that skips the failure handler cannot cause an
+infinite retry. Failures back off exponentially and are capped. `mem rebuild`
+deliberately leaves the queue alone, because a pending task is the one piece
+of state the filesystem cannot reproduce.
+
+### Optional media dependencies
+
+```bash
+uv sync --extra media            # Pillow, pypdf, python-docx
+uv sync --extra transcription    # faster-whisper
+uv sync --extra ocr              # pytesseract (also needs the tesseract binary)
+```
+
+**The core install needs none of them.** A missing dependency degrades to the
+metadata that is still extractable and reports `status: "degraded"` with a
+warning naming the extra that fixes it — never a crash, and never a silent
+empty result. Video additionally wants `ffmpeg`/`ffprobe` on `PATH`.
+`mem capabilities` reports exactly what is available; re-run
+`mem reprocess <asset-id> --force` after installing something.
+
+Third-party processors register through the `memory.processors` entry point
+group, so a new media type can ship as a separate package.
 
 ## Memory maintenance
 
@@ -127,6 +197,9 @@ permanent deletion requires `confirm: true`.
 | Identity | UUID per memory, SHA-256 content addressing for media |
 | Deletion | Soft (superseded) and permanent are separate; tombstones prevent resurrection |
 | Dependencies | Deleting a source removes what was derived from it |
+| Multimodal | Pluggable processors; media extras optional, degrade not crash |
+| Retrieval | Segment-level, with timestamp/page provenance on every hit |
+| Background work | SQLite-backed lease queue; survives process death, retries with backoff |
 | Consolidation | Lexical duplicate/conflict detection; proposes, never writes |
 | Intelligence | Optional, pluggable LLM provider; every feature works without one |
 | Backup | tar of `data/` minus the index; explicit retention, lossless round trip |
@@ -138,7 +211,9 @@ Memory types: `fact`, `preference`, `event`, `decision`, `procedure`.
 ```
 data/memories/<type>/<uuid>.md   authoritative memory files
 data/assets/blobs/ab/cd/<sha>    content-addressed media
-data/derived/                    transcripts, descriptions, keyframes
+data/derived/transcripts/        extracted text, timestamps, page numbers
+data/derived/descriptions/       image metadata and OCR output
+data/derived/keyframes/          frames sampled from video
 data/index/memory.sqlite         rebuildable index
 data/.journal/                   operation journal
 data/.tombstones/                deletion records

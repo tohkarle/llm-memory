@@ -136,14 +136,50 @@ Archives exclude the index (rebuildable) and always include tombstones.
 Import is additive and **cannot resurrect a purged memory** — exporting first
 is not a way around a deletion. Before any bulk operation, back up.
 
-## Attachments
+## Attachments and ingestion
 
 ```bash
-mem asset add ./paper.pdf --link-to <memory-id> --tag research
+mem asset add ./paper.pdf --link-to <memory-id> --tag research   # store only
+mem ingest ./talk.mp4 --tag conference                           # store + extract
+mem ingest ./notes/ --recursive --tag research
 ```
 
-Stores the file content-addressed and attaches it. The asset id is stable
-across `mem asset replace`, so links survive new versions.
+`asset add` stores bytes. **`ingest` also extracts searchable text** —
+transcript, PDF/docx text, OCR — and indexes it as segments with locators.
+Prefer `ingest` unless you only need the file attached.
+
+Type detection reads magic numbers, so a mislabelled extension is handled.
+Override with `--media-type`. `--param KEY=VALUE` tunes the processor
+(`--param ocr=false`, `--param model=small`, `--param keyframe_interval_s=10`).
+
+Cheap processors (text, image, PDF, docx) run inline. **Audio and video are
+deferred** — `ingest` returns `status: "queued"` with a `queued_task`, and
+nothing is searchable until `mem queue run`. `--inline` forces it now and
+blocks; `--defer` queues a cheap one.
+
+Reprocessing is memoized on asset+processor+version+params, so a re-ingest
+returns `status: "cached"` rather than transcribing again. `mem reprocess
+<asset-id> --force` overrides.
+
+```bash
+mem queue list --status failed    # what broke, with last_error
+mem queue run                     # drain ready work
+mem queue retry --all-failed      # after installing a missing extra
+```
+
+**Status vocabulary**: `complete` (text extracted), `degraded` (stored, an
+optional dependency was missing — read `warnings`), `queued`, `cached`,
+`unsupported` (no processor; still stored and findable by tag/filename).
+`degraded` is not failure: re-run `mem reprocess --force` once the extra is
+installed. `mem capabilities` lists what is present; extras are `media`,
+`transcription`, `ocr`.
+
+Originals are never modified. Derived output lives under `data/derived/` and
+is rebuildable via `mem rebuild`.
+
+An asset is not a memory. Record the *claim* with `mem create` and cite the
+asset — `--source asset:<asset-id>` — rather than relying on the transcript
+to be re-found.
 
 ## After writing
 
