@@ -1260,6 +1260,7 @@ class MemoryAPI:
         min_count: int = 1,
         limit: int = 100,
         include_inactive: bool = False,
+        include_secret: bool = False,
         near_misses: bool = False,
     ) -> dict[str, Any]:
         """Existing tag (or entity) vocabulary with usage counts.
@@ -1273,6 +1274,15 @@ class MemoryAPI:
         tag carried solely by superseded or deleted memories is not something
         to scope a recall by, and including it would overstate what a filter
         would return.
+
+        ``secret`` memories are excluded unless ``include_secret``, matching
+        the default of ``search`` and ``get_context``. Two reasons, and the
+        second is the stronger one. A count that included them would stop
+        predicting what ``--tag <value>`` returns, which is the whole job of
+        this listing. And the tag string is itself a disclosure: ``secret``
+        exists for memories whose *subject* -- an unannounced project, a
+        client name -- should not surface by default, so publishing the slug
+        and a usage count would leak exactly what the sensitivity protects.
         """
         if facet not in ("tag", "entity"):
             raise ValueError(f"facet: expected 'tag' or 'entity', got {facet!r}")
@@ -1284,6 +1294,8 @@ class MemoryAPI:
         table = "memory_tags" if facet == "tag" else "memory_entities"
         column = facet
         where = ["1=1"] if include_inactive else ["m.status = 'active'"]
+        if not include_secret:
+            where.append("m.sensitivity != 'secret'")
         params: list[Any] = []
         if prefix:
             # LIKE would treat % and _ in the prefix as wildcards, and `_` is

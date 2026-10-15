@@ -65,6 +65,9 @@ named things — `--tag backend`, `--entity SQLite`.
 returns a subset. Search both, then merge or retag. `mem tags --near-misses`
 groups the suspects.
 
+Counts match the default `mem search --tag <t>`: both exclude `secret`. Pass
+`--include-secret` to either to see it.
+
 ## segment search — inside ingested media
 
 ```bash

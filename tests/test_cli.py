@@ -784,3 +784,79 @@ class TestTagsCommand:
         code, payload, _ = run(runner, root, "tags", flag, value)
         assert code == EXIT_VALIDATION
         assert payload["error"]["code"] == "validation"
+
+    # ---------------------------------------------------------- sensitivity
+
+    @staticmethod
+    def search_total(runner: CliRunner, root: Path, tag: str) -> int:
+        """What a default `mem search --tag <tag>` actually returns."""
+        code, payload, _ = run(runner, root, "search", "--tag", tag)
+        assert code == 0, payload
+        return int(payload["data"]["total"])
+
+    @staticmethod
+    def tags_count(runner: CliRunner, root: Path, tag: str, *args: str) -> int | None:
+        """The count `mem tags` reports for one tag, or None if unlisted."""
+        code, payload, _ = run(runner, root, "tags", *args)
+        assert code == 0, payload
+        for row in payload["data"]["tags"]:
+            if row["tag"] == tag:
+                return int(row["count"])
+        return None
+
+    def test_count_predicts_what_search_returns(self, runner: CliRunner, root: Path) -> None:
+        """The listed count must equal the default search's hit count.
+
+        The tag is carried at three different sensitivities, so the two sides
+        can genuinely disagree: the count comes from `tags` and the
+        expectation from a separate `search` invocation, not from one call.
+        """
+        create(runner, root, title="Normal", tag="projectsec", sensitivity="normal")
+        create(runner, root, title="Private", tag="projectsec", sensitivity="private")
+        create(runner, root, title="Secret", tag="projectsec", sensitivity="secret")
+
+        assert self.search_total(runner, root, "projectsec") == 2
+        assert self.tags_count(runner, root, "projectsec") == 2
+
+        # And with the flag, both sides move together to include the secret.
+        code, payload, _ = run(runner, root, "search", "--tag", "projectsec", "--include-secret")
+        assert code == 0
+        assert payload["data"]["total"] == 3
+        assert self.tags_count(runner, root, "projectsec", "--include-secret") == 3
+
+    def test_a_secret_only_tag_is_not_listed(self, runner: CliRunner, root: Path) -> None:
+        """The slug is itself the disclosure, so it must not surface by default."""
+        create(runner, root, title="Only secret", tag="onlysecret", sensitivity="secret")
+        create(runner, root, title="Visible", tag="shown", sensitivity="normal")
+
+        code, payload, _ = run(runner, root, "tags")
+        assert code == 0
+        assert [t["tag"] for t in payload["data"]["tags"]] == ["shown"]
+        assert payload["data"]["total"] == 1
+        # Nothing to find by it either -- the listing would have been a dead end.
+        assert self.search_total(runner, root, "onlysecret") == 0
+
+        # Opt in and it appears, which proves the tag existed all along.
+        assert self.tags_count(runner, root, "onlysecret", "--include-secret") == 1
+
+    def test_secret_entities_are_hidden_too(self, runner: CliRunner, root: Path) -> None:
+        """The entity facet shares the listing's SQL, so it shares the hole."""
+        create(runner, root, title="Secret", entity="AcmeCorp", sensitivity="secret")
+        create(runner, root, title="Normal", entity="SQLite", sensitivity="normal")
+
+        _, payload, _ = run(runner, root, "tags", "--entities")
+        assert [e["entity"] for e in payload["data"]["entities"]] == ["SQLite"]
+
+        _, payload, _ = run(runner, root, "tags", "--entities", "--include-secret")
+        assert sorted(e["entity"] for e in payload["data"]["entities"]) == [
+            "AcmeCorp",
+            "SQLite",
+        ]
+
+    def test_include_inactive_still_hides_secret(self, runner: CliRunner, root: Path) -> None:
+        """The two flags are independent; neither implies the other."""
+        create(runner, root, title="Secret", tag="secrettag", sensitivity="secret")
+        create(runner, root, title="Normal", tag="plaintag", sensitivity="normal")
+
+        _, payload, _ = run(runner, root, "tags", "--include-inactive")
+        assert [t["tag"] for t in payload["data"]["tags"]] == ["plaintag"]

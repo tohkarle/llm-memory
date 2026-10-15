@@ -1006,6 +1006,7 @@ def stats(ctx: click.Context) -> None:
 @click.option("--min-count", type=int, default=1, show_default=True)
 @click.option("--limit", type=int, default=100, show_default=True)
 @click.option("--include-inactive", is_flag=True, help="Count superseded and deleted too.")
+@click.option("--include-secret", is_flag=True, help="Count secret memories too.")
 @click.option("--near-misses", is_flag=True, help="Group likely drifted spellings.")
 @click.pass_context
 def tags(
@@ -1015,6 +1016,7 @@ def tags(
     min_count: int,
     limit: int,
     include_inactive: bool,
+    include_secret: bool,
     near_misses: bool,
 ) -> None:
     """The existing tag vocabulary, with usage counts. Reuse before coining."""
@@ -1028,6 +1030,7 @@ def tags(
                 min_count=min_count,
                 limit=limit,
                 include_inactive=include_inactive,
+                include_secret=include_secret,
                 near_misses=near_misses,
             )
         finally:

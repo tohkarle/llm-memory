@@ -80,6 +80,9 @@ project / domain / lifecycle; `--entity` for the named things themselves.
   absence — `synctasks` and `sync-tasks` are two tags, so either filter
   silently misses the other's memories. `mem tags --near-misses` shows splits
   already there.
+- **`mem tags` hides `secret` memories' tags; `--include-secret` to see them.**
+  The slug leaks the subject. Tagging a secret project? Check with the flag
+  first, or you coin a duplicate of a tag you cannot see.
 - **2–5 tags.** Fifteen is noise; zero is findable only by keyword.
 - Lowercase `[a-z0-9]` plus `-`/`_` only — no colons, no spaces. Pick one
   separator and keep it.
