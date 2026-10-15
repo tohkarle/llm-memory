@@ -25,6 +25,7 @@ from memory.extract import (
     from_text,
     heuristic_candidates,
     llm_candidates,
+    strip_speaker,
 )
 from memory.models import MemoryType, SourceKind, SourceRef
 from memory.processors.base import ProcessResult
@@ -458,3 +459,26 @@ def test_report_defaults_are_empty_not_none() -> None:
     report = ExtractionReport(candidates=[])
     assert report.to_json()["total"] == 0
     assert report.created == [] and report.skipped == []
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        ("User: I prefer uv over pip", "I prefer uv over pip"),
+        ("Assistant: I always run tests", "I always run tests"),
+        ("- Me: I work in Singapore", "I work in Singapore"),
+        ("**User:** I prefer ruff", "I prefer ruff"),
+        ("I prefer uv over pip", "I prefer uv over pip"),
+        ("Ratio: 3:1 is fine", "3:1 is fine"),
+    ],
+)
+def test_strip_speaker_removes_transcript_labels(line: str, expected: str) -> None:
+    assert strip_speaker(line) == expected
+
+
+def test_heuristic_titles_are_assertions_not_transcript_lines() -> None:
+    """A title must assert something about the person, not about the log's format."""
+    text = "User: I always run tests before pushing to main."
+    candidate = heuristic_candidates(text, source=CONVERSATION)[0]
+    assert candidate.title == "I always run tests before pushing to main"
+    assert not candidate.title.startswith("User")

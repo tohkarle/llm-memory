@@ -315,6 +315,24 @@ _COMPILED = tuple(
 
 _SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+|\n{2,}")
 
+#: Transcript speaker labels ("User:", "Assistant:", "Me -"). Stripped before
+#: a sentence becomes a title: a title is a standalone assertion, and
+#: "User: I always run tests" asserts something about a transcript's
+#: formatting rather than about the person.
+#: Two forms, because the colon sits inside the emphasis in one and outside
+#: in the other: ``**User:**`` and ``User:``.
+_SPEAKER_PREFIX = re.compile(
+    r"^[-*>\s]*(?:"
+    r"\*\*\s*[\w .'-]{1,24}\s*:?\s*\*\*\s*:?"  # **User:** / **User**:
+    r"|[A-Z][\w .'-]{0,24}:"  # User:
+    r")\s+"
+)
+
+
+def strip_speaker(text: str) -> str:
+    """Remove a leading transcript speaker label, if there is one."""
+    return _SPEAKER_PREFIX.sub("", text, count=1).strip()
+
 
 def heuristic_candidates(
     text: str,
@@ -332,7 +350,7 @@ def heuristic_candidates(
     seen: set[str] = set()
 
     for ordinal, sentence in enumerate(_SENTENCE_SPLIT.split(text)):
-        flat = " ".join(sentence.split())
+        flat = strip_speaker(" ".join(sentence.split()))
         if not (MIN_STATEMENT_CHARS <= len(flat) <= MAX_STATEMENT_CHARS):
             continue
         for pattern, mem_type, label in _COMPILED:
@@ -611,4 +629,5 @@ __all__ = [
     "from_text",
     "heuristic_candidates",
     "llm_candidates",
+    "strip_speaker",
 ]
