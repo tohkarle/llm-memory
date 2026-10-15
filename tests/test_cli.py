@@ -579,3 +579,208 @@ class TestQueueCancelExitCode:
         code, payload, _ = run(runner, root, "queue", "cancel", task_id)
         assert code == EXIT_NOT_FOUND
         assert "cancelled" in payload["error"]["message"]
+
+
+class TestTagsCommand:
+    """`mem tags` -- the tag vocabulary, so drift is visible and reuse possible.
+
+    Every fixture here is deliberately asymmetric: counts differ from each
+    other, and count order disagrees with alphabetical order, so an
+    implementation that sorted by name (or returned rows in grouping order)
+    would fail rather than coincidentally agree.
+    """
+
+    @staticmethod
+    def seed(runner: CliRunner, root: Path) -> None:
+        # `zeta` is alphabetically last but the most used, and `alpha` is
+        # alphabetically first but the least used -- so name order is the
+        # reverse of count order and the two cannot be confused.
+        for i in range(3):
+            create(runner, root, title=f"Zeta {i}", tag="zeta")
+        for i in range(2):
+            create(runner, root, title=f"Mid {i}", tag="mid")
+        create(runner, root, title="Alpha only", tag="alpha")
+
+    def test_counts_are_per_memory(self, runner: CliRunner, root: Path) -> None:
+        self.seed(runner, root)
+        _, payload, _ = run(runner, root, "tags")
+        counts = {t["tag"]: t["count"] for t in payload["data"]["tags"]}
+        assert counts == {"zeta": 3, "mid": 2, "alpha": 1}
+        assert payload["data"]["total"] == 3
+
+    def test_ordered_by_count_not_name(self, runner: CliRunner, root: Path) -> None:
+        self.seed(runner, root)
+        _, payload, _ = run(runner, root, "tags")
+        names = [t["tag"] for t in payload["data"]["tags"]]
+        assert names == ["zeta", "mid", "alpha"]
+        # The assertion above is only meaningful because the two orders differ.
+        assert names != sorted(names)
+
+    def test_equal_counts_break_ties_by_name(self, runner: CliRunner, root: Path) -> None:
+        # Insert in reverse-alphabetical order: if the tiebreaker were absent,
+        # insertion/grouping order would surface `beta` first.
+        for tag in ("delta", "charlie", "beta"):
+            create(runner, root, title=f"Tie {tag}", tag=tag)
+        _, payload, _ = run(runner, root, "tags")
+        names = [t["tag"] for t in payload["data"]["tags"]]
+        assert names == ["beta", "charlie", "delta"]
+
+    def test_drifted_spellings_are_distinct_rows(self, runner: CliRunner, root: Path) -> None:
+        """The silent-subset bug, made visible: one topic, two tags."""
+        for i in range(3):
+            create(runner, root, title=f"Sync {i}", tag="synctasks")
+        create(runner, root, title="Drifted", tag="sync-tasks")
+
+        _, payload, _ = run(runner, root, "tags")
+        rows = {t["tag"]: t["count"] for t in payload["data"]["tags"]}
+        assert rows == {"synctasks": 3, "sync-tasks": 1}
+
+        # And the consequence: filtering by either tag misses the other's memory.
+        _, payload, _ = run(runner, root, "search", "--tag", "synctasks")
+        assert payload["data"]["total"] == 3
+        _, payload, _ = run(runner, root, "search", "--tag", "sync-tasks")
+        assert payload["data"]["total"] == 1
+
+    def test_near_misses_group_separator_drift(self, runner: CliRunner, root: Path) -> None:
+        for i in range(3):
+            create(runner, root, title=f"Sync {i}", tag="synctasks")
+        create(runner, root, title="Hyphen", tag="sync-tasks")
+        create(runner, root, title="Underscore", tag="sync_tasks")
+        create(runner, root, title="Unrelated", tag="billing")
+
+        _, payload, _ = run(runner, root, "tags", "--near-misses")
+        groups = payload["data"]["near_misses"]
+        assert len(groups) == 1
+        assert [m["value"] for m in groups[0]["members"]] == [
+            "sync-tasks",
+            "sync_tasks",
+            "synctasks",
+        ]
+        assert groups[0]["total"] == 5
+        # `billing` shares no skeleton with them, so it must not be dragged in.
+        assert "billing" not in str(groups)
+
+    def test_near_misses_catch_multi_separator_drift(self, runner: CliRunner, root: Path) -> None:
+        """Two separators apart -- beyond one edit, so only the skeleton rule finds it.
+
+        `end-to-end` vs `endtoend` differ by two characters, which the
+        edit-distance pass rejects. This is what proves separator-stripping is
+        doing the work rather than riding on the distance check.
+        """
+        for i in range(2):
+            create(runner, root, title=f"E2E {i}", tag="end-to-end")
+        create(runner, root, title="Collapsed", tag="endtoend")
+
+        _, payload, _ = run(runner, root, "tags", "--near-misses")
+        groups = payload["data"]["near_misses"]
+        assert len(groups) == 1
+        assert [m["value"] for m in groups[0]["members"]] == ["end-to-end", "endtoend"]
+        assert groups[0]["total"] == 3
+
+    def test_near_misses_catch_a_one_character_typo(self, runner: CliRunner, root: Path) -> None:
+        """Different skeletons, one edit apart -- only the distance check finds it."""
+        for i in range(2):
+            create(runner, root, title=f"Backend {i}", tag="backend")
+        create(runner, root, title="Typo", tag="backen")
+
+        _, payload, _ = run(runner, root, "tags", "--near-misses")
+        groups = payload["data"]["near_misses"]
+        assert len(groups) == 1
+        assert [m["value"] for m in groups[0]["members"]] == ["backen", "backend"]
+
+    def test_near_misses_absent_without_the_flag(self, runner: CliRunner, root: Path) -> None:
+        create(runner, root, title="A", tag="synctasks")
+        create(runner, root, title="B", tag="sync-tasks")
+        _, payload, _ = run(runner, root, "tags")
+        assert "near_misses" not in payload["data"]
+
+    def test_near_misses_empty_on_a_clean_vocabulary(self, runner: CliRunner, root: Path) -> None:
+        for tag in ("billing", "frontend", "research"):
+            create(runner, root, title=f"Clean {tag}", tag=tag)
+        _, payload, _ = run(runner, root, "tags", "--near-misses")
+        assert payload["data"]["near_misses"] == []
+
+    def test_prefix_scopes_the_listing(self, runner: CliRunner, root: Path) -> None:
+        create(runner, root, title="One", tag="project-synctasks")
+        create(runner, root, title="Two", tag="project-notion-todos")
+        create(runner, root, title="Three", tag="backend")
+
+        _, payload, _ = run(runner, root, "tags", "--prefix", "project-")
+        names = sorted(t["tag"] for t in payload["data"]["tags"])
+        assert names == ["project-notion-todos", "project-synctasks"]
+        # `total` must honour the prefix too, not report the whole vocabulary.
+        assert payload["data"]["total"] == 2
+
+    def test_prefix_underscore_is_not_a_wildcard(self, runner: CliRunner, root: Path) -> None:
+        """`_` is legal in a tag, so a LIKE-based prefix would over-match."""
+        create(runner, root, title="Literal", tag="a_b")
+        create(runner, root, title="Wildcard bait", tag="axb")
+
+        _, payload, _ = run(runner, root, "tags", "--prefix", "a_")
+        assert [t["tag"] for t in payload["data"]["tags"]] == ["a_b"]
+
+    def test_min_count_drops_rare_tags(self, runner: CliRunner, root: Path) -> None:
+        self.seed(runner, root)
+        _, payload, _ = run(runner, root, "tags", "--min-count", "2")
+        assert [t["tag"] for t in payload["data"]["tags"]] == ["zeta", "mid"]
+
+    def test_limit_truncates_but_total_does_not(self, runner: CliRunner, root: Path) -> None:
+        self.seed(runner, root)
+        _, payload, _ = run(runner, root, "tags", "--limit", "2")
+        assert payload["data"]["returned"] == 2
+        assert payload["data"]["total"] == 3
+        # Truncation keeps the most-used, not an arbitrary two.
+        assert [t["tag"] for t in payload["data"]["tags"]] == ["zeta", "mid"]
+
+    def test_deleted_memories_are_excluded_by_default(self, runner: CliRunner, root: Path) -> None:
+        kept = create(runner, root, title="Kept", tag="kept-tag")
+        gone = create(runner, root, title="Gone", tag="gone-tag")
+        code, _, _ = run(runner, root, "delete", gone, "--reason", "test")
+        assert code == 0
+
+        _, payload, _ = run(runner, root, "tags")
+        assert [t["tag"] for t in payload["data"]["tags"]] == ["kept-tag"]
+
+        _, payload, _ = run(runner, root, "tags", "--include-inactive")
+        assert sorted(t["tag"] for t in payload["data"]["tags"]) == ["gone-tag", "kept-tag"]
+        assert kept  # both memories existed; only status separates them
+
+    def test_entities_facet_lists_entities(self, runner: CliRunner, root: Path) -> None:
+        create(runner, root, title="One", tag="backend", entity="SQLite")
+        create(runner, root, title="Two", tag="backend", entity="SQLite")
+        create(runner, root, title="Three", tag="backend", entity="Click")
+
+        _, payload, _ = run(runner, root, "tags", "--entities")
+        assert payload["data"]["facet"] == "entity"
+        assert [(e["entity"], e["count"]) for e in payload["data"]["entities"]] == [
+            ("SQLite", 2),
+            ("Click", 1),
+        ]
+        # The tag facet is unaffected -- the two listings are separate.
+        _, payload, _ = run(runner, root, "tags")
+        assert [t["tag"] for t in payload["data"]["tags"]] == ["backend"]
+
+    def test_entities_keep_their_case(self, runner: CliRunner, root: Path) -> None:
+        """Unlike tags, entities are names; a lowercasing listing would fail."""
+        create(runner, root, title="Cased", entity="SQLite")
+        _, payload, _ = run(runner, root, "tags", "--entities")
+        assert [e["entity"] for e in payload["data"]["entities"]] == ["SQLite"]
+
+    def test_empty_vocabulary_is_not_an_error(self, runner: CliRunner, root: Path) -> None:
+        create(runner, root, title="Untagged")
+        code, payload, _ = run(runner, root, "tags")
+        assert code == 0
+        assert payload["data"] == {
+            "facet": "tag",
+            "total": 0,
+            "returned": 0,
+            "tags": [],
+        }
+
+    @pytest.mark.parametrize(("flag", "value"), [("--limit", "0"), ("--min-count", "0")])
+    def test_rejects_nonsense_bounds(
+        self, runner: CliRunner, root: Path, flag: str, value: str
+    ) -> None:
+        code, payload, _ = run(runner, root, "tags", flag, value)
+        assert code == EXIT_VALIDATION
+        assert payload["error"]["code"] == "validation"

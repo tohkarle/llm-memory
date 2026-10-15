@@ -1252,6 +1252,75 @@ class MemoryAPI:
             self.conn.commit()
         return report
 
+    def tags(
+        self,
+        *,
+        facet: str = "tag",
+        prefix: str | None = None,
+        min_count: int = 1,
+        limit: int = 100,
+        include_inactive: bool = False,
+        near_misses: bool = False,
+    ) -> dict[str, Any]:
+        """Existing tag (or entity) vocabulary with usage counts.
+
+        The point is reuse: an agent that cannot see the vocabulary coins a new
+        tag every session, and ``--tag synctasks`` then silently returns a
+        subset of the memories about SyncTasks. Counting is a GROUP BY over the
+        normalized side table, which is already indexed by value.
+
+        Counts cover ``active`` memories only unless ``include_inactive``: a
+        tag carried solely by superseded or deleted memories is not something
+        to scope a recall by, and including it would overstate what a filter
+        would return.
+        """
+        if facet not in ("tag", "entity"):
+            raise ValueError(f"facet: expected 'tag' or 'entity', got {facet!r}")
+        if limit < 1:
+            raise ValueError(f"limit: must be >= 1, got {limit}")
+        if min_count < 1:
+            raise ValueError(f"min_count: must be >= 1, got {min_count}")
+
+        table = "memory_tags" if facet == "tag" else "memory_entities"
+        column = facet
+        where = ["1=1"] if include_inactive else ["m.status = 'active'"]
+        params: list[Any] = []
+        if prefix:
+            # LIKE would treat % and _ in the prefix as wildcards, and `_` is
+            # legal in a tag. Compare the slice instead.
+            where.append(f"substr(t.{column}, 1, ?) = ?")
+            params += [len(prefix), prefix]
+
+        rows = self.conn.execute(
+            # `table` and `column` come from the facet check above, never from input.
+            f"SELECT t.{column} AS value, count(*) AS c"
+            f" FROM {table} t JOIN memories m ON m.id = t.memory_id"
+            f" WHERE {' AND '.join(where)}"
+            f" GROUP BY t.{column} HAVING c >= ?"
+            # Name is the tiebreaker, so equal counts never reorder between
+            # runs -- otherwise SQLite's grouping order leaks into the output.
+            f" ORDER BY c DESC, value ASC LIMIT ?",
+            [*params, min_count, limit],
+        ).fetchall()
+
+        items = [{facet: row["value"], "count": row["c"]} for row in rows]
+        total = self.conn.execute(
+            f"SELECT count(DISTINCT t.{column}) AS n"
+            f" FROM {table} t JOIN memories m ON m.id = t.memory_id"
+            f" WHERE {' AND '.join(where)}",
+            params,
+        ).fetchone()["n"]
+
+        out: dict[str, Any] = {
+            "facet": facet,
+            "total": total,
+            "returned": len(items),
+            "tags" if facet == "tag" else "entities": items,
+        }
+        if near_misses:
+            out["near_misses"] = _near_misses([(i[facet], i["count"]) for i in items])
+        return out
+
     def stats(self) -> dict[str, Any]:
         cur = self.conn
         by_type = {
@@ -1317,6 +1386,96 @@ class MemoryAPI:
 
 
 # ---------------------------------------------------------------- helpers
+
+
+def _skeleton(value: str) -> str:
+    """Collapse the variations ``normalize_tag`` deliberately keeps distinct.
+
+    ``normalize_tag`` lowercases and turns whitespace into hyphens, so
+    ``sync-tasks``, ``sync_tasks`` and ``synctasks`` all survive as three
+    separate tags. That is exactly the drift an agent produces across
+    sessions, and dropping the separators is what makes the three collapse
+    onto one key.
+    """
+    return value.casefold().replace("-", "").replace("_", "")
+
+
+def _within_one_edit(a: str, b: str) -> bool:
+    """True when ``a`` and ``b`` differ by one insertion, deletion or swap.
+
+    Exact rather than a similarity score, and cheap: a length gap above one
+    already answers no, so the single scan never needs an edit matrix.
+    """
+    if a == b:
+        return False
+    if abs(len(a) - len(b)) > 1:
+        return False
+    if len(a) > len(b):
+        a, b = b, a
+    i = j = 0
+    spent = False
+    while i < len(a) and j < len(b):
+        if a[i] == b[j]:
+            i += 1
+            j += 1
+            continue
+        if spent:
+            return False
+        spent = True
+        j += 1
+        if len(a) == len(b):  # substitution: advance both
+            i += 1
+    return True
+
+
+def _near_misses(items: list[tuple[str, int]]) -> list[dict[str, Any]]:
+    """Group values that look like drifted spellings of one another.
+
+    Deterministic and dependency-free, over the listed values only, so the
+    common path pays nothing for it. The counts are the tell: ``synctasks 40``
+    beside ``sync-tasks 12`` is plainly one vocabulary that split in two, not
+    two separate topics.
+    """
+    counts = dict(items)
+    values = list(counts)
+    parent = {v: v for v in values}
+
+    def find(v: str) -> str:
+        while parent[v] != v:
+            parent[v] = parent[parent[v]]
+            v = parent[v]
+        return v
+
+    def union(a: str, b: str) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+
+    by_skeleton: dict[str, list[str]] = {}
+    for value in values:
+        by_skeleton.setdefault(_skeleton(value), []).append(value)
+    for members in by_skeleton.values():
+        for other in members[1:]:
+            union(members[0], other)
+
+    for index, value in enumerate(values):
+        for other in values[index + 1 :]:
+            if _within_one_edit(_skeleton(value), _skeleton(other)):
+                union(value, other)
+
+    groups: dict[str, list[str]] = {}
+    for value in values:
+        groups.setdefault(find(value), []).append(value)
+
+    drifted = [sorted(members) for members in groups.values() if len(members) > 1]
+    drifted.sort(key=lambda members: (-sum(counts[v] for v in members), members[0]))
+    return [
+        {
+            "members": [{"value": v, "count": counts[v]} for v in members],
+            "total": sum(counts[v] for v in members),
+        }
+        for members in drifted
+    ]
 
 
 def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:

@@ -1001,6 +1001,42 @@ def stats(ctx: click.Context) -> None:
 
 
 @main.command()
+@click.option("--entities", "facet", flag_value="entity", help="List entities instead of tags.")
+@click.option("--prefix", help="Only values starting with this, e.g. --prefix project-.")
+@click.option("--min-count", type=int, default=1, show_default=True)
+@click.option("--limit", type=int, default=100, show_default=True)
+@click.option("--include-inactive", is_flag=True, help="Count superseded and deleted too.")
+@click.option("--near-misses", is_flag=True, help="Group likely drifted spellings.")
+@click.pass_context
+def tags(
+    ctx: click.Context,
+    facet: str | None,
+    prefix: str | None,
+    min_count: int,
+    limit: int,
+    include_inactive: bool,
+    near_misses: bool,
+) -> None:
+    """The existing tag vocabulary, with usage counts. Reuse before coining."""
+
+    def action() -> dict[str, Any]:
+        api = open_api(ctx, read_only=True)
+        try:
+            return api.tags(
+                facet=facet or "tag",
+                prefix=prefix,
+                min_count=min_count,
+                limit=limit,
+                include_inactive=include_inactive,
+                near_misses=near_misses,
+            )
+        finally:
+            api.close()
+
+    run("tags", action)
+
+
+@main.command()
 @click.option("--limit", type=int, default=20, show_default=True)
 @click.pass_context
 def review(ctx: click.Context, limit: int) -> None:
