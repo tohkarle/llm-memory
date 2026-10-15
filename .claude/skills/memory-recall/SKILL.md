@@ -42,6 +42,29 @@ mem get <id> --related --follow                   # full text + neighbours
 
 Returns `{total, hits[{memory_id, title, type, score, snippet, tags}]}`.
 
+## Scope by tag when a project is in play
+
+```bash
+mem tags                                          # the vocabulary, by usage
+mem tags --prefix project-                        # just the project tags
+mem search --tag project-synctasks "queue"        # scoped
+mem search --all-tags project-synctasks --all-tags backend   # both, not either
+mem search --entity SQLite                        # by proper noun
+```
+
+**An unscoped recall answers from every project at once.** The user works
+across many; "how do we handle retries" has a different answer per project
+and keyword search cannot tell them apart. Scope with `--tag project-<slug>`
+whenever you know which project, and `mem tags` is how you learn the slug.
+
+`--tag` is any-of, `--all-tags` is all-of. Tags are facets, entities are the
+named things — `--tag backend`, `--entity SQLite`.
+
+**Two counts for one topic in `mem tags` means drift** — `synctasks 40` beside
+`sync-tasks 12` is one vocabulary split in two, and either filter alone
+returns a subset. Search both, then merge or retag. `mem tags --near-misses`
+groups the suspects.
+
 ## segment search — inside ingested media
 
 ```bash

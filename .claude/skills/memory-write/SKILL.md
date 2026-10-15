@@ -43,7 +43,7 @@ default for a reason.
 ```bash
 mem create --type preference --title "Prefers uv over pip for Python projects" \
   --body "Uses uv for every project; dislikes pip's resolver." \
-  --tag tooling --entity uv --confidence 0.9 --profile \
+  --tag tooling --tag project-synctasks --entity uv --confidence 0.9 --profile \
   --source conversation:conversations/2026-10-15.md:L120-L142
 ```
 
@@ -61,6 +61,28 @@ mem create --type preference --title "Prefers uv over pip for Python projects" \
 - `--sensitivity private|secret` for personal material; `secret` is excluded
   from search unless explicitly requested.
 - `--review-after 2027-01-01` for anything that will go stale.
+
+## Tags and entities
+
+**Tags are retrieval facets; entities are the proper nouns.** `--tag` for
+project / domain / lifecycle; `--entity` for the named things themselves.
+`--tag backend --entity SQLite`, not the reverse.
+
+| tag | for |
+|---|---|
+| `project-<slug>` | which project this belongs to |
+| `backend`, `tooling`, `hiring` | domain |
+| `provenance-lost`, `needs-review` | lifecycle |
+
+- **Project work gets `project-<slug>` on every write.** An untagged memory is
+  unscoped forever, and an unscoped recall answers from a different project.
+- **`mem tags` first; reuse before coining.** Drift is the failure, not
+  absence — `synctasks` and `sync-tasks` are two tags, so either filter
+  silently misses the other's memories. `mem tags --near-misses` shows splits
+  already there.
+- **2–5 tags.** Fifteen is noise; zero is findable only by keyword.
+- Lowercase `[a-z0-9]` plus `-`/`_` only — no colons, no spaces. Pick one
+  separator and keep it.
 
 ## Anti-patterns
 
