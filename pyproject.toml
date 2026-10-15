@@ -28,7 +28,10 @@ video = "memory.processors.video:VideoProcessor"
 document = "memory.processors.document:DocumentProcessor"
 
 [project.optional-dependencies]
-mcp = ["mcp>=1.2"]
+# Pinned below 2: memory/mcp_server.py targets the 1.x low-level Server API
+# (decorator handler registration, camelCase Tool fields). 2.x moves both, so
+# an unpinned resolve breaks the server at import time.
+mcp = ["mcp>=1.2,<2"]
 tokenizer = ["tiktoken>=0.7"]
 
 # Media processing. Every one of these is optional on purpose: the core

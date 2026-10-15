@@ -5,8 +5,9 @@ which calls :class:`~memory.api.MemoryAPI`, so there is exactly one
 implementation of each operation and the logic stays testable without this
 module's optional dependency.
 
-Targets the mcp 2.x API, where tool handlers are constructor callbacks
-(``on_list_tools`` / ``on_call_tool``) rather than decorators.
+Targets the mcp 1.x API that ``pyproject.toml`` pins: tool handlers are
+registered with the ``@server.list_tools()`` / ``@server.call_tool()``
+decorators, and ``types.Tool`` takes ``inputSchema``.
 
 The ``mcp`` package is an optional extra (``uv sync --extra mcp``).
 Run with ``python -m memory.mcp_server``.
@@ -23,9 +24,21 @@ try:
     import mcp.types as types
     from mcp.server import Server
     from mcp.server.stdio import stdio_server
-except ModuleNotFoundError as exc:  # pragma: no cover - exercised by hand
-    raise ModuleNotFoundError(
-        "the MCP server needs the optional 'mcp' extra: uv sync --extra mcp"
+except ImportError as exc:  # pragma: no cover - exercised by hand
+    # ImportError, not ModuleNotFoundError: an *installed* package missing an
+    # expected name raises the bare parent class, which would otherwise
+    # escape as a traceback instead of this actionable message. The two cases
+    # need different fixes, so they get different messages.
+    if isinstance(exc, ModuleNotFoundError) and (exc.name or "").split(".")[0] == "mcp":
+        raise ModuleNotFoundError(
+            "the MCP server needs the optional 'mcp' extra: uv sync --extra mcp"
+        ) from exc
+    raise ImportError(
+        f"the installed 'mcp' package is not compatible with this server ({exc}). "
+        "This module targets the mcp 1.x API pinned in pyproject.toml; "
+        "run `uv sync --extra dev --extra mcp` to install it. If the package "
+        "looks installed but will not import, the virtualenv may be corrupt: "
+        "`rm -rf .venv && uv sync --extra dev --extra mcp`."
     ) from exc
 
 
@@ -38,11 +51,11 @@ def tool_definitions() -> list[types.Tool]:
             types.Tool(
                 name=spec["name"],
                 description=spec["description"],
-                input_schema=spec["schema"],
+                inputSchema=spec["schema"],
                 annotations=types.ToolAnnotations(
-                    read_only_hint=spec["name"] in READ_ONLY,
-                    destructive_hint=destructive,
-                    idempotent_hint=not destructive,
+                    readOnlyHint=spec["name"] in READ_ONLY,
+                    destructiveHint=destructive,
+                    idempotentHint=not destructive,
                 ),
             )
         )
@@ -76,20 +89,16 @@ def call(name: str, arguments: dict[str, Any] | None) -> types.CallToolResult:
             "error": {"code": type(exc).__name__, "message": str(exc)},
         }
         is_error = True
+    # isError, not is_error: pydantic ignores an unknown kwarg here, so the
+    # snake_case spelling silently reported every failure as a success.
     return types.CallToolResult(
         content=[types.TextContent(type="text", text=json.dumps(payload, indent=2, default=str))],
-        is_error=is_error,
+        isError=is_error,
     )
 
 
-def build_server() -> Server[None]:
-    async def on_list_tools(_ctx: Any, _params: Any = None) -> types.ListToolsResult:
-        return types.ListToolsResult(tools=tool_definitions())
-
-    async def on_call_tool(_ctx: Any, params: types.CallToolRequestParams) -> types.CallToolResult:
-        return call(params.name, dict(params.arguments or {}))
-
-    return Server(
+def build_server() -> Server[None, None]:
+    server: Server[None, None] = Server(
         SERVER_NAME,
         version="0.1.0",
         instructions=(
@@ -98,9 +107,23 @@ def build_server() -> Server[None]:
             "that depends on prior knowledge, and record durable statements with "
             "memory_create."
         ),
-        on_list_tools=on_list_tools,
-        on_call_tool=on_call_tool,
     )
+
+    # mcp 1.x ships these decorators unannotated, so --strict flags the call
+    # and the functions they wrap. Suppressed at the two call sites rather
+    # than module-wide, so real typing errors here are still reported.
+    @server.list_tools()  # type: ignore[no-untyped-call, untyped-decorator]
+    async def on_list_tools() -> list[types.Tool]:
+        return tool_definitions()
+
+    # validate_input=False: `handle` already validates, and its ValueError
+    # becomes the readable is_error envelope below. Letting the transport
+    # reject first would surface a schema error the model cannot act on.
+    @server.call_tool(validate_input=False)  # type: ignore[untyped-decorator]
+    async def on_call_tool(name: str, arguments: dict[str, Any] | None) -> types.CallToolResult:
+        return call(name, arguments)
+
+    return server
 
 
 async def serve() -> None:  # pragma: no cover - requires a live client

@@ -425,7 +425,8 @@ class TestServerShell:
         assert {t.name for t in tools} == set(HANDLERS)
         for tool in tools:
             assert tool.description
-            assert tool.input_schema["type"] == "object"
+            # camelCase: the mcp 1.x wire names, which pyproject pins.
+            assert tool.inputSchema["type"] == "object"
             assert tool.annotations is not None
 
     def test_destructive_tools_are_annotated(self) -> None:
@@ -434,9 +435,9 @@ class TestServerShell:
         from memory.mcp_server import tool_definitions
 
         by_name = {t.name: t for t in tool_definitions()}
-        assert by_name["memory_delete"].annotations.destructive_hint is True
-        assert by_name["memory_search"].annotations.read_only_hint is True
-        assert by_name["memory_create"].annotations.read_only_hint is False
+        assert by_name["memory_delete"].annotations.destructiveHint is True
+        assert by_name["memory_search"].annotations.readOnlyHint is True
+        assert by_name["memory_create"].annotations.readOnlyHint is False
 
     def test_call_returns_an_envelope(self, root: Path, monkeypatch: Any) -> None:
         pytest.importorskip("mcp")
@@ -444,7 +445,7 @@ class TestServerShell:
         from memory.mcp_server import call
 
         result = call("memory_create", {"type": "fact", "title": "Via MCP", "body": "b"})
-        assert result.is_error is False
+        assert result.isError is False
         payload = json.loads(result.content[0].text)
         assert payload["ok"] is True
         assert payload["data"]["memory"]["title"] == "Via MCP"
@@ -458,7 +459,7 @@ class TestServerShell:
         from memory.mcp_server import call
 
         result = call("memory_get", {"memory_id": "not-a-uuid"})
-        assert result.is_error is True
+        assert result.isError is True
         payload = json.loads(result.content[0].text)
         assert payload["ok"] is False
         assert payload["error"]["message"]
@@ -469,7 +470,7 @@ class TestServerShell:
         from memory.mcp_server import call
 
         result = call("memory_nonsense", {})
-        assert result.is_error is True
+        assert result.isError is True
 
     def test_import_error_is_actionable(self) -> None:
         """Without the extra, the message must name the fix."""
