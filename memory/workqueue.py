@@ -238,7 +238,7 @@ def claim(
         if task.attempts >= task.max_attempts:
             # Exhausted but never marked: the worker died before it could
             # record the final failure.
-            _finish(conn, task.id, "failed", error="attempts exhausted")
+            _finish(conn, task.id, "failed", error="attempts exhausted", guard=False)
             continue
         cur = conn.execute(
             """
@@ -267,43 +267,93 @@ def claim(
     return None
 
 
+# A worker's claim is an identity, not just an id: `status='running'` plus the
+# exact lease it was granted. Recording an outcome has to re-check that
+# identity for the same reason `claim` does, because between claim and outcome
+# the row may have moved on without the worker knowing:
+#
+# * a human cancelled the task -- `complete` would silently undo the cancel,
+#   and `fail` would requeue a cancelled task;
+# * the lease expired and another worker legitimately reclaimed it -- the first
+#   worker's late outcome would clear the *new* owner's lease mid-task, and the
+#   asset would be processed a third time.
+#
+# So `complete` and `fail` assert the whole claimed identity -- `running` plus
+# the exact lease the caller was granted, which is what distinguishes *this*
+# claim from a successor's -- and return falsey without writing when it no
+# longer holds. Callers pass `expected_lease=claimed.lease_expires_at`.
+#
+# `guard=False` opts out, for the one caller with no claim to assert: `claim`
+# itself, marking a row whose worker died before recording its exhaustion.
+
+_OWNERSHIP_GUARD = """
+   AND status = 'running'
+   AND COALESCE(lease_expires_at, '') = COALESCE(:expected_lease, '')
+"""
+
+
+def _ownership_guard(guard: bool) -> str:
+    return _OWNERSHIP_GUARD if guard else ""
+
+
 def complete(
-    conn: sqlite3.Connection, task_id: str, *, result: dict[str, Any] | None = None
-) -> None:
-    _finish(conn, task_id, "done", result=result)
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    result: dict[str, Any] | None = None,
+    expected_lease: str | None = None,
+    guard: bool = True,
+) -> bool:
+    """Mark a claimed task done. False if the claim is no longer ours."""
+    return _finish(conn, task_id, "done", result=result, expected_lease=expected_lease, guard=guard)
 
 
-def fail(conn: sqlite3.Connection, task_id: str, error: str, *, retry: bool = True) -> Task | None:
-    """Record a failure, scheduling a backed-off retry if attempts remain."""
+def fail(
+    conn: sqlite3.Connection,
+    task_id: str,
+    error: str,
+    *,
+    retry: bool = True,
+    expected_lease: str | None = None,
+    guard: bool = True,
+) -> Task | None:
+    """Record a failure, scheduling a backed-off retry if attempts remain.
+
+    Returns ``None`` when the task is gone *or* when the claim is no longer
+    ours, so a caller that cares can tell it did not write.
+    """
     row = conn.execute("SELECT * FROM work_queue WHERE id = ?", (task_id,)).fetchone()
     if row is None:
         return None
     task = Task.from_row(row)
     message = error[:2000]
+    where = "WHERE id = :id" + _ownership_guard(guard)
+    params: dict[str, Any] = {"error": message, "id": task_id, "expected_lease": expected_lease}
 
     if retry and task.attempts < task.max_attempts:
         index = min(max(task.attempts - 1, 0), len(BACKOFF_S) - 1)
-        delay = BACKOFF_S[index]
-        conn.execute(
-            """
+        cur = conn.execute(
+            f"""
             UPDATE work_queue
                SET status = 'pending', last_error = :error, claimed_at = NULL,
                    lease_expires_at = NULL, not_before = :not_before
-             WHERE id = :id
+            {where}
             """,
-            {"error": message, "not_before": _plus(delay), "id": task_id},
+            {**params, "not_before": _plus(BACKOFF_S[index])},
         )
     else:
-        conn.execute(
-            """
+        cur = conn.execute(
+            f"""
             UPDATE work_queue
                SET status = 'failed', last_error = :error, finished_at = :now,
                    lease_expires_at = NULL
-             WHERE id = :id
+            {where}
             """,
-            {"error": message, "now": _now(), "id": task_id},
+            {**params, "now": _now()},
         )
     conn.commit()
+    if cur.rowcount == 0:
+        return None
     return get(conn, task_id)
 
 
@@ -314,13 +364,16 @@ def _finish(
     *,
     error: str | None = None,
     result: dict[str, Any] | None = None,
-) -> None:
+    expected_lease: str | None = None,
+    guard: bool = True,
+) -> bool:
     payload_sql = ""
     params: dict[str, Any] = {
         "status": status,
         "now": _now(),
         "id": task_id,
         "error": error,
+        "expected_lease": expected_lease,
     }
     if result is not None:
         # Merge the outcome into the payload so `mem queue list` can show what
@@ -330,16 +383,17 @@ def _finish(
         current["result"] = result
         params["payload"] = json.dumps(current)
         payload_sql = ", payload = :payload"
-    conn.execute(
+    cur = conn.execute(
         f"""
         UPDATE work_queue
            SET status = :status, finished_at = :now, last_error = :error,
                lease_expires_at = NULL{payload_sql}
-         WHERE id = :id
+         WHERE id = :id{_ownership_guard(guard)}
         """,
         params,
     )
     conn.commit()
+    return cur.rowcount == 1
 
 
 def get(conn: sqlite3.Connection, task_id: str) -> Task | None:
@@ -478,6 +532,7 @@ def drain(
     """
     done: list[str] = []
     failed: list[dict[str, str]] = []
+    lost: list[dict[str, str]] = []
     processed = 0
     while limit is None or processed < limit:
         task = claim(conn, kinds=kinds, lease_s=lease_s)
@@ -487,11 +542,19 @@ def drain(
         try:
             result = handler(task)
         except Exception as exc:
-            fail(conn, task.id, f"{type(exc).__name__}: {exc}")
-            failed.append({"id": task.id, "error": f"{type(exc).__name__}: {exc}"})
+            message = f"{type(exc).__name__}: {exc}"
+            if fail(conn, task.id, message, expected_lease=task.lease_expires_at) is None:
+                lost.append({"id": task.id, "error": message})
+            else:
+                failed.append({"id": task.id, "error": message})
             continue
-        complete(conn, task.id, result=result)
-        done.append(task.id)
+        if complete(conn, task.id, result=result, expected_lease=task.lease_expires_at):
+            done.append(task.id)
+        else:
+            # Cancelled, or reclaimed by another worker after our lease ran
+            # out. Either way the outcome is not ours to record: overwriting
+            # the row would undo the cancel or clear the new owner's lease.
+            lost.append({"id": task.id, "error": "claim lost before the result was recorded"})
     # `completed`/`errors` rather than `done`/`failed`: stats() reports queue
     # totals under those names, and a merged dict would silently shadow this
     # run's per-task detail with a count.
@@ -499,6 +562,7 @@ def drain(
         "processed": processed,
         "completed": done,
         "errors": failed,
+        "lost": lost,
         "stats": stats(conn),
     }
 

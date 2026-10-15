@@ -6,6 +6,7 @@ import struct
 import zlib
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -393,7 +394,9 @@ class TestQueueDurability:
         api.ingest(notes(tmp_path), defer=True)
         claimed = workqueue.claim(api.conn)
         assert claimed is not None
-        after = workqueue.fail(api.conn, claimed.id, "boom")
+        after = workqueue.fail(
+            api.conn, claimed.id, "boom", expected_lease=claimed.lease_expires_at
+        )
         assert after is not None
         assert after.status == "pending"
         assert after.not_before is not None
@@ -406,7 +409,9 @@ class TestQueueDurability:
         api.conn.commit()
         claimed = workqueue.claim(api.conn)
         assert claimed is not None
-        after = workqueue.fail(api.conn, claimed.id, "boom")
+        after = workqueue.fail(
+            api.conn, claimed.id, "boom", expected_lease=claimed.lease_expires_at
+        )
         assert after is not None and after.status == "failed"
 
     def test_retry_resets_a_failed_task(self, api: MemoryAPI, tmp_path: Path) -> None:
@@ -438,6 +443,81 @@ class TestQueueDurability:
         task_id = api.ingest(wav(tmp_path))["queued_task"]
         assert api.queue_cancel(str(task_id))["cancelled"] is True
         assert api.queue_stats()["pending"] == 0
+
+    def test_cancelling_a_running_task_survives_the_worker_completing_it(
+        self, api: MemoryAPI, tmp_path: Path
+    ) -> None:
+        """`cancel` supports running tasks; `complete` must not undo it.
+
+        The user-visible path: cancel a long transcription, get
+        ``{"cancelled": true}``, and the worker finishes moments later.
+        """
+        task_id = str(api.ingest(wav(tmp_path))["queued_task"])
+        claimed = workqueue.claim(api.conn)
+        assert claimed is not None and claimed.status == "running"
+        assert api.queue_cancel(task_id)["cancelled"] is True
+
+        wrote = workqueue.complete(
+            api.conn, task_id, result={"ok": True}, expected_lease=claimed.lease_expires_at
+        )
+        assert wrote is False, "complete() must refuse a task it no longer owns"
+        assert workqueue.get(api.conn, task_id).status == "cancelled"  # type: ignore[union-attr]
+
+    def test_cancelling_a_running_task_survives_the_worker_failing_it(
+        self, api: MemoryAPI, tmp_path: Path
+    ) -> None:
+        """A cancelled task must not be requeued by a late failure."""
+        task_id = str(api.ingest(wav(tmp_path))["queued_task"])
+        claimed = workqueue.claim(api.conn)
+        assert claimed is not None
+        assert api.queue_cancel(task_id)["cancelled"] is True
+
+        assert (
+            workqueue.fail(api.conn, task_id, "boom", expected_lease=claimed.lease_expires_at)
+            is None
+        )
+        after = workqueue.get(api.conn, task_id)
+        assert after is not None and after.status == "cancelled"
+        assert after.not_before is None, "a cancelled task must not be rescheduled"
+
+    def test_a_stale_worker_cannot_destroy_the_new_owners_lease(
+        self, api: MemoryAPI, tmp_path: Path
+    ) -> None:
+        """A dies, B legitimately reclaims, A reports late. B keeps its lease.
+
+        Without the guard A's late outcome resets the row to pending and
+        clears B's lease, so B's work is thrown away and the asset is
+        processed a third time while B is still running.
+        """
+        task_id = str(api.ingest(wav(tmp_path))["queued_task"])
+        a = workqueue.claim(api.conn, lease_s=-1)  # a lease already expired
+        assert a is not None and a.attempts == 1
+        b = workqueue.claim(api.conn, lease_s=3600)
+        assert b is not None and b.id == task_id and b.attempts == 2
+        assert b.lease_expires_at != a.lease_expires_at
+
+        assert (
+            workqueue.fail(api.conn, task_id, "A died late", expected_lease=a.lease_expires_at)
+            is None
+        )
+        after = workqueue.get(api.conn, task_id)
+        assert after is not None
+        assert after.status == "running"
+        assert after.lease_expires_at == b.lease_expires_at, "B's live lease was destroyed"
+
+    def test_drain_reports_a_task_whose_claim_it_lost(self, api: MemoryAPI, tmp_path: Path) -> None:
+        """Losing the claim must be logged and skipped, not written over."""
+        task_id = str(api.ingest(wav(tmp_path))["queued_task"])
+
+        def handler(task: workqueue.Task) -> dict[str, Any]:
+            # A human cancels while this handler is running.
+            api.queue_cancel(task.id)
+            return {"ok": True}
+
+        report = workqueue.drain(api.conn, handler, limit=1)
+        assert report["completed"] == []
+        assert [entry["id"] for entry in report["lost"]] == [task_id]
+        assert workqueue.get(api.conn, task_id).status == "cancelled"  # type: ignore[union-attr]
 
     def test_purge_keeps_unfinished_work(self, api: MemoryAPI, tmp_path: Path) -> None:
         api.ingest(wav(tmp_path))
