@@ -25,6 +25,17 @@ from typing import Any
 #: user the exact command that fixes it.
 MEDIA_EXTRA = "media"
 
+#: Which extra actually ships each optional module. A hint that names the
+#: wrong extra is worse than no hint, because the user runs it and the
+#: dependency is still missing.
+MODULE_EXTRAS: dict[str, str] = {
+    "PIL": "media",
+    "pypdf": "media",
+    "docx": "media",
+    "faster_whisper": "transcription",
+    "pytesseract": "ocr",
+}
+
 
 @dataclass(frozen=True, slots=True)
 class Capability:
@@ -56,20 +67,23 @@ class Capability:
 
 
 @cache
-def python_module(module: str, *, extra: str | None = MEDIA_EXTRA) -> Capability:
+def python_module(module: str, *, extra: str | None = None) -> Capability:
     """Probe an importable module without importing it.
 
     ``find_spec`` rather than ``import``: importing a large module the caller
     may never use costs real startup time, and a module that raises at import
     would otherwise take the probe with it.
     """
+    # Resolve the owning extra from the table unless the caller overrode it,
+    # so the remediation hint is a command that actually works.
+    owning = extra or MODULE_EXTRAS.get(module.split(".", 1)[0], MEDIA_EXTRA)
     try:
         spec = importlib.util.find_spec(module)
     except (ImportError, ValueError):
         spec = None
     if spec is None:
-        return Capability(module, False, "not installed", extra)
-    return Capability(module, True, "", extra)
+        return Capability(module, False, "not installed", owning)
+    return Capability(module, True, "", owning)
 
 
 def load(module: str) -> Any | None:
@@ -193,6 +207,7 @@ def reset_probes() -> None:
 
 __all__ = [
     "MEDIA_EXTRA",
+    "MODULE_EXTRAS",
     "Capability",
     "Degradation",
     "binary",

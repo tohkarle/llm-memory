@@ -35,6 +35,12 @@ DERIVED_TABLES = (
 )
 
 
+#: Columns whose value legitimately changes per indexing run, so comparing
+#: them would assert that two rebuilds happened in the same second. Same set
+#: as tests/test_rebuild_equivalence.py, for the same reason.
+VOLATILE = {"indexed_at", "mtime_ns", "rowid"}
+
+
 def dump(conn: Any, tables: tuple[str, ...] = DERIVED_TABLES) -> dict[str, list[str]]:
     """A canonical, order-independent snapshot of the index."""
     out: dict[str, list[str]] = {}
@@ -44,7 +50,7 @@ def dump(conn: Any, tables: tuple[str, ...] = DERIVED_TABLES) -> dict[str, list[
         # the only way to enumerate columns.
         out[table] = sorted(
             json.dumps(
-                {key: row[key] for key in row.keys()},  # noqa: SIM118
+                {key: row[key] for key in row.keys() if key not in VOLATILE},  # noqa: SIM118
                 sort_keys=True,
                 default=str,
             )
