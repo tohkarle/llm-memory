@@ -315,10 +315,29 @@ _COMPILED = tuple(
 
 _SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+|\n{2,}")
 
-#: Transcript speaker labels ("User:", "Assistant:", "Me -"). Stripped before
-#: a sentence becomes a title: a title is a standalone assertion, and
-#: "User: I always run tests" asserts something about a transcript's
-#: formatting rather than about the person.
+#: Double quotes only -- an apostrophe is not a quotation ("I'd rather",
+#: "don't"), and counting it would mute ordinary first-person statements.
+_DOUBLE_QUOTE = re.compile(r"[\"\u201c\u201d]")
+
+
+def inside_a_quotation(text: str, position: int) -> bool:
+    """Whether ``position`` falls inside a quoted span.
+
+    Catches the third-person attribution: `My coworker said "I always deploy
+    on Friday"` is a true quote of someone who is not the user, so recording
+    it as the user's own habit is the same false attribution a speaker label
+    prevents -- just one level further in. An odd number of double quotes
+    before the match means the match is inside the quotation.
+    """
+    return len(_DOUBLE_QUOTE.findall(text[:position])) % 2 == 1
+
+
+#: Transcript speaker labels ("User:", "Assistant:", "Me -"). Split off
+#: before a sentence becomes a title, for two reasons: a title is a
+#: standalone assertion, and "User: I always run tests" asserts something
+#: about a transcript's formatting rather than about the person; and the
+#: label is the only evidence of *who said it*, which decides whether the
+#: sentence is evidence about the user at all.
 #: Two forms, because the colon sits inside the emphasis in one and outside
 #: in the other: ``**User:**`` and ``User:``.
 _SPEAKER_PREFIX = re.compile(
@@ -329,9 +348,61 @@ _SPEAKER_PREFIX = re.compile(
 )
 
 
+#: Speaker labels whose words are *not* evidence about the user. A transcript
+#: line is a true quote of whoever said it; attributing the assistant's "I
+#: prefer pytest" to the user writes a false belief into long-term memory,
+#: and the only evidence of who spoke is the label itself -- so it must be
+#: read, not discarded. A denylist rather than an allowlist: the user's own
+#: label varies ("User", "Me", "Human", their name), while the voices that
+#: are *not* them can be enumerated.
+NON_USER_SPEAKERS = frozenset(
+    {
+        "agent",
+        "ai",
+        "assistant",
+        "bot",
+        "chatgpt",
+        "claude",
+        "copilot",
+        "gemini",
+        "gpt",
+        "llm",
+        "model",
+        "system",
+    }
+)
+
+
+def split_speaker(text: str) -> tuple[str | None, str]:
+    """Separate a leading transcript speaker label from what it said.
+
+    Returns ``(speaker, remainder)``, with ``speaker`` ``None`` when the line
+    carries no label. The label is returned rather than dropped because it is
+    the only thing distinguishing a statement *by* the user from a statement
+    *to* them.
+    """
+    match = _SPEAKER_PREFIX.match(text)
+    if match is None:
+        return None, text.strip()
+    label = match.group(0).strip().strip("-*>: 	")
+    label = label.replace("*", "").strip().rstrip(":").strip()
+    return (label or None), text[match.end() :].strip()
+
+
 def strip_speaker(text: str) -> str:
     """Remove a leading transcript speaker label, if there is one."""
-    return _SPEAKER_PREFIX.sub("", text, count=1).strip()
+    return split_speaker(text)[1]
+
+
+def is_user_speaker(label: str | None) -> bool:
+    """Whether a line's speaker is the person the memories are about.
+
+    Unlabelled and unrecognised labels both count as the user: the prefix
+    pattern also fires on ordinary prose, so refusing everything not on
+    :data:`USER_SPEAKERS` would silently stop extracting from plain notes.
+    Only the known non-user voices are refused.
+    """
+    return label is None or label.casefold() not in NON_USER_SPEAKERS
 
 
 def heuristic_candidates(
@@ -350,12 +421,22 @@ def heuristic_candidates(
     seen: set[str] = set()
 
     for ordinal, sentence in enumerate(_SENTENCE_SPLIT.split(text)):
-        flat = strip_speaker(" ".join(sentence.split()))
+        speaker, flat = split_speaker(" ".join(sentence.split()))
+        # Someone else's words are not evidence about the user, however
+        # first-person they read.
+        if not is_user_speaker(speaker):
+            continue
+        # A question states nothing. "Should I always run the formatter?" is
+        # the user asking whether to adopt a habit, not reporting one.
+        if flat.endswith("?"):
+            continue
         if not (MIN_STATEMENT_CHARS <= len(flat) <= MAX_STATEMENT_CHARS):
             continue
         for pattern, mem_type, label in _COMPILED:
             match = pattern.search(flat)
             if match is None:
+                continue
+            if inside_a_quotation(flat, match.start()):
                 continue
             title = clean_title(flat.rstrip(".!?"))
             if len(title) > 200:
@@ -380,7 +461,11 @@ def heuristic_candidates(
                     ],
                     rationale=f"matched the {label} pattern; verify before committing",
                     source_kind="heuristic",
-                    evidence={"pattern": label, "quote": flat[:300]},
+                    evidence={
+                        "pattern": label,
+                        "quote": flat[:300],
+                        "speaker": speaker or "unlabelled",
+                    },
                 )
             )
             break
@@ -628,6 +713,9 @@ __all__ = [
     "from_suggestions",
     "from_text",
     "heuristic_candidates",
+    "inside_a_quotation",
+    "is_user_speaker",
     "llm_candidates",
+    "split_speaker",
     "strip_speaker",
 ]

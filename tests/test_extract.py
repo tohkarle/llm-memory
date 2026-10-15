@@ -476,6 +476,106 @@ def test_strip_speaker_removes_transcript_labels(line: str, expected: str) -> No
     assert strip_speaker(line) == expected
 
 
+INTERLEAVED_TRANSCRIPT = """\
+User: I prefer tabs over spaces.
+Assistant: I always recommend pinning versions.
+Assistant: I prefer pytest over unittest.
+Claude: We decided to use Postgres for this.
+User: I work in Singapore.
+"""
+
+
+def test_only_the_users_lines_become_candidates() -> None:
+    """The assistant's own words are not evidence about the user.
+
+    `strip_speaker` used to delete the speaker label, which is the only thing
+    distinguishing "User: I prefer pytest" from "Assistant: I prefer pytest".
+    The surviving first-person "I" was then recorded as the user's own
+    preference, with honest-looking provenance -- a true quote under a false
+    attribution, which `--commit` persists and recall later acts on.
+    """
+    titles = [c.title for c in heuristic_candidates(INTERLEAVED_TRANSCRIPT, source=CONVERSATION)]
+    assert titles == ["I prefer tabs over spaces", "I work in Singapore"]
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "Assistant: I always recommend pinning versions.",
+        "Claude: I prefer pytest over unittest.",
+        "**Assistant:** We decided to use Postgres for this.",
+        "- Claude: I work in Singapore.",
+        "ChatGPT: I always run the formatter.",
+        "Bot: I prefer tabs over spaces.",
+    ],
+)
+def test_non_user_speakers_are_skipped(line: str) -> None:
+    assert heuristic_candidates(line, source=CONVERSATION) == []
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "User: I prefer tabs over spaces.",
+        "**User:** I prefer tabs over spaces.",
+        "- Me: I prefer tabs over spaces.",
+        "Human: I prefer tabs over spaces.",
+        "I prefer tabs over spaces.",
+    ],
+)
+def test_user_and_unlabelled_speakers_still_extract(line: str) -> None:
+    """An unlabelled line is the common case -- plain notes, a single-voice
+    document -- and must not be collateral damage of the speaker check."""
+    candidates = heuristic_candidates(line, source=CONVERSATION)
+    assert [c.title for c in candidates] == ["I prefer tabs over spaces"]
+
+
+def test_the_speaker_is_recorded_as_evidence() -> None:
+    """Attribution a reviewer cannot see is attribution taken on faith."""
+    candidate = heuristic_candidates("User: I prefer tabs over spaces.", source=CONVERSATION)[0]
+    assert candidate.evidence["speaker"] == "User"
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "Should I always run the formatter before committing?",
+        "User: Do we decided to use Postgres?",
+        "Would I prefer tabs over spaces?",
+    ],
+)
+def test_questions_are_not_assertions(line: str) -> None:
+    """A question is the absence of a claim, not a quiet one."""
+    assert heuristic_candidates(line, source=CONVERSATION) == []
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        'My coworker said "I always deploy on Friday" which I think is reckless.',
+        'She told me "I prefer tabs over spaces" last week.',
+        'The docs claim "we decided to use Postgres for this" somewhere.',
+    ],
+)
+def test_claims_quoted_from_someone_else_are_not_the_users(line: str) -> None:
+    """A quotation is attribution too, one level in from the speaker label."""
+    assert heuristic_candidates(line, source=CONVERSATION) == []
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "I prefer tabs over spaces.",
+        "I'd rather use tabs over spaces.",
+        'I prefer tabs, and I once said "spaces are fine" about CSS.',
+    ],
+)
+def test_an_apostrophe_or_a_trailing_quote_does_not_mute_the_user(line: str) -> None:
+    """Only double quotes count: an apostrophe is not a quotation, and a
+    quoted aside *after* the claim leaves the claim the user's own."""
+    assert heuristic_candidates(line, source=CONVERSATION)
+
+
 def test_heuristic_titles_are_assertions_not_transcript_lines() -> None:
     """A title must assert something about the person, not about the log's format."""
     text = "User: I always run tests before pushing to main."
