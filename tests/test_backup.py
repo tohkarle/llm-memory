@@ -233,6 +233,22 @@ def test_read_manifest_rejects_a_foreign_archive(tmp_path: Path) -> None:
         read_manifest(archive)
 
 
+def test_read_manifest_rejects_a_truncated_archive(api: MemoryAPI, tmp_path: Path) -> None:
+    """Half a valid archive is a format error, not a bare decompressor crash.
+
+    An interrupted copy or a full disk leaves a gzip member cut mid-stream,
+    and the decompressor raises `EOFError` rather than any `TarError` -- so
+    the caller saw an unhandled exception from the stdlib instead of being
+    told which archive is unreadable.
+    """
+    seed_corpus(api)
+    whole = Path(backup(api).path).read_bytes()
+    truncated = tmp_path / "truncated.tar.gz"
+    truncated.write_bytes(whole[: len(whole) // 2])
+    with pytest.raises(ArchiveFormatError):
+        read_manifest(truncated)
+
+
 def test_read_manifest_rejects_a_future_archive_version(tmp_path: Path) -> None:
     """Refuse rather than guess at a layout change."""
     archive = tmp_path / "future.tar"

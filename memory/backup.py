@@ -22,9 +22,11 @@ rule that can empty the backup directory is a data-loss bug, not a policy.
 
 from __future__ import annotations
 
+import gzip
 import json
 import shutil
 import tarfile
+import zlib
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -333,7 +335,11 @@ def read_manifest(archive: Path) -> dict[str, Any]:
             if member is None:
                 raise ArchiveFormatError(f"{archive}: {MANIFEST_NAME} is not a regular file")
             payload = json.loads(member.read().decode("utf-8"))
-    except tarfile.TarError as exc:
+    # A gzip member cut mid-stream -- an interrupted copy, a full disk --
+    # surfaces as `EOFError`/`zlib.error`/`BadGzipFile` straight from the
+    # decompressor, never wrapped in a `TarError`, so a truncated but
+    # otherwise valid archive would escape as an unhandled stdlib exception.
+    except (tarfile.TarError, EOFError, zlib.error, gzip.BadGzipFile) as exc:
         raise ArchiveFormatError(f"{archive} is not a readable tar archive: {exc}") from None
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise ArchiveFormatError(f"{archive}: unreadable manifest: {exc}") from None
