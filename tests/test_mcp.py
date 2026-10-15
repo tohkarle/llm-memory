@@ -322,6 +322,94 @@ class TestAssetTools:
             call(root, "memory_delete_asset", asset_id=asset_id, permanent=True)
 
 
+class TestIngestionTools:
+    """The multimodal surface: extract, search inside media, drain the queue."""
+
+    def test_ingest_extracts_and_indexes(self, root: Path, tmp_path: Path) -> None:
+        source = tmp_path / "notes.md"
+        source.write_text(
+            "Pricing tiers are free and pro.\n\nRollback reverts the release tag.\n",
+            encoding="utf-8",
+        )
+        payload = call(root, "memory_ingest", path=str(source), tags=["doc"])
+        assert payload["status"] == "complete"
+        assert payload["segments"] >= 1
+        assert payload["processor"] == "text"
+
+    def test_search_segments_carries_provenance(self, root: Path, tmp_path: Path) -> None:
+        source = tmp_path / "notes.md"
+        source.write_text("Rollback reverts the release tag.", encoding="utf-8")
+        ingested = call(root, "memory_ingest", path=str(source))
+        found = call(root, "memory_search_segments", query="rollback")
+        assert found["total"] == 1
+        hit = found["hits"][0]
+        assert hit["asset_id"] == ingested["asset_id"]
+        assert hit["processor"] == "text"
+
+    def test_segment_search_is_read_only(self) -> None:
+        assert "memory_search_segments" in READ_ONLY_TOOLS
+
+    def test_audio_is_queued_not_run_inline(self, root: Path, tmp_path: Path) -> None:
+        """An MCP client must not be blocked by an unbounded transcription."""
+        import struct
+
+        data = b"\x00\x00" * 800
+        source = tmp_path / "clip.wav"
+        source.write_bytes(
+            b"RIFF"
+            + struct.pack("<I", 36 + len(data))
+            + b"WAVE"
+            + b"fmt "
+            + struct.pack("<IHHIIHH", 16, 1, 1, 8000, 16000, 2, 16)
+            + b"data"
+            + struct.pack("<I", len(data))
+            + data
+        )
+        payload = call(root, "memory_ingest", path=str(source))
+        assert payload["status"] == "queued"
+        assert payload["queued_task"]
+
+        status = call(root, "memory_queue_run", status_only=True)
+        assert status["ran"] is False
+        assert status["stats"]["pending"] == 1
+
+        ran = call(root, "memory_queue_run")
+        assert ran["ran"] is True
+        assert ran["processed"] == 1
+
+    def test_inline_overrides_the_queue(self, root: Path, tmp_path: Path) -> None:
+        import struct
+
+        data = b"\x00\x00" * 400
+        source = tmp_path / "c.wav"
+        source.write_bytes(
+            b"RIFF"
+            + struct.pack("<I", 36 + len(data))
+            + b"WAVE"
+            + b"fmt "
+            + struct.pack("<IHHIIHH", 16, 1, 1, 8000, 16000, 2, 16)
+            + b"data"
+            + struct.pack("<I", len(data))
+            + data
+        )
+        payload = call(root, "memory_ingest", path=str(source), inline=True)
+        assert payload["status"] != "queued"
+
+    def test_ingest_a_directory(self, root: Path, tmp_path: Path) -> None:
+        folder = tmp_path / "docs"
+        folder.mkdir()
+        for i in range(2):
+            (folder / f"n{i}.md").write_text(f"Note {i} about staging.", encoding="utf-8")
+        payload = call(root, "memory_ingest", path=str(folder), recursive=True)
+        assert payload["count"] == 2
+
+    def test_every_new_tool_has_a_handler_and_schema(self) -> None:
+        for name in ("memory_ingest", "memory_search_segments", "memory_queue_run"):
+            assert name in HANDLERS
+            spec = next(t for t in TOOLS if t["name"] == name)
+            assert spec["description"] and spec["schema"]["type"] == "object"
+
+
 class TestServerShell:
     def test_builds_when_mcp_is_installed(self) -> None:
         pytest.importorskip("mcp")

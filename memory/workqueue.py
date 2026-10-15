@@ -34,7 +34,7 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any
 
-from .models import fmt_ts, now_utc, parse_ts
+from .models import fmt_ts, now_utc
 
 #: How long a claim is valid. Comfortably longer than the slowest expected
 #: task (transcribing a long recording) so a live worker is never treated as
@@ -549,16 +549,6 @@ def reap_expired(conn: sqlite3.Connection) -> int:
     )
     conn.commit()
     return int(cur.rowcount) + int(exhausted.rowcount)
-
-
-def ensure_parsed(stamp: str | None) -> Any:
-    """Parse a queue timestamp, tolerating a hand-edited row."""
-    if not stamp:
-        return None
-    try:
-        return parse_ts(stamp)
-    except Exception:
-        return None
 
 
 __all__ = [

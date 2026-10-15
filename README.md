@@ -181,8 +181,10 @@ The CLI emits a JSON envelope on stdout (`{"ok": true, "data": {...}}`); logs go
 stderr. `mem context --format markdown` is the one command that prints prose, because
 it is meant to be pasted into a prompt.
 
-An optional MCP server (`uv sync --extra mcp`) exposes the same 15 operations
-to MCP clients over stdio: `python -m memory.mcp_server`. Set `MEMORY_ROOT` to
+An optional MCP server (`uv sync --extra mcp`) exposes the same 18 operations
+to MCP clients over stdio: `python -m memory.mcp_server`. That includes
+`memory_ingest`, `memory_search_segments` and `memory_queue_run`, so a client
+can extract and search inside media rather than only storing it. Set `MEMORY_ROOT` to
 choose the data directory. Destructive tools are annotated as such, and
 permanent deletion requires `confirm: true`.
 

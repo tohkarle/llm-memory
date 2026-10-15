@@ -241,6 +241,70 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "memory_ingest",
+        "description": (
+            "Import a local file and extract searchable text from it: transcript, "
+            "PDF/docx text, or OCR. Prefer this over memory_store_asset, which "
+            "only stores bytes. Audio and video are queued rather than processed "
+            "inline (status 'queued'); run memory_queue_run to execute them. A "
+            "status of 'degraded' means the file was stored but an optional "
+            "dependency was missing -- read 'warnings'."
+        ),
+        "schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "A file or a directory."},
+                "media_type": {"type": "string"},
+                "tags": {"type": "array", "items": {"type": "string"}},
+                "link_to": {"type": "array", "items": {"type": "string"}},
+                "recursive": {"type": "boolean", "default": False},
+                "inline": {
+                    "type": "boolean",
+                    "description": "Process now instead of queueing. May take minutes.",
+                },
+            },
+            "required": ["path"],
+        },
+    },
+    {
+        "name": "memory_search_segments",
+        "description": (
+            "Full-text search inside ingested media -- transcripts, document text, "
+            "OCR output. This is a different index from memory_search, which covers "
+            "memories only, so check both. Every hit carries the locator a citation "
+            "needs: start_ms/end_ms for audio and video, page for PDF, "
+            "meta.heading for docx."
+        ),
+        "schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "asset_id": {"type": "string", "description": "Restrict to one asset."},
+                "limit": {"type": "integer", "default": 20},
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "memory_queue_run",
+        "description": (
+            "Run deferred processing work (transcription). Blocks until the queue "
+            "drains or 'limit' tasks are done, which can take minutes. Call with no "
+            "arguments to see outstanding counts without running anything."
+        ),
+        "schema": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "description": "Stop after this many tasks."},
+                "status_only": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Report queue counts without running work.",
+                },
+            },
+        },
+    },
+    {
         "name": "memory_get_asset",
         "description": "Read an asset's metadata and storage path. Does not return bytes.",
         "schema": {
@@ -487,6 +551,45 @@ def _store_asset(api: MemoryAPI, args: dict[str, Any]) -> dict[str, Any]:
     return {"asset": asset.to_json()}
 
 
+def _ingest(api: MemoryAPI, args: dict[str, Any]) -> dict[str, Any]:
+    path = Path(args["path"])
+    # `inline` is exposed rather than the CLI's tri-state `defer`, because an
+    # MCP client cannot tolerate an unbounded call it did not ask for.
+    defer = False if args.get("inline") else None
+    kwargs: dict[str, Any] = {
+        "media_type": args.get("media_type"),
+        "tags": args.get("tags"),
+        "link_to": args.get("link_to"),
+        "defer": defer,
+    }
+    if path.is_dir():
+        results = api.ingest_directory(path, recursive=bool(args.get("recursive")), **kwargs)
+        return {
+            "directory": str(path),
+            "count": len(results),
+            "segments": sum(r["segments"] for r in results),
+            "results": results,
+        }
+    return api.ingest(path, **kwargs)
+
+
+def _search_segments(api: MemoryAPI, args: dict[str, Any]) -> dict[str, Any]:
+    hits = api.search_segments(
+        str(args["query"]),
+        asset_id=args.get("asset_id"),
+        limit=int(args.get("limit", 20)),
+    )
+    return {"query": args["query"], "total": len(hits), "hits": hits}
+
+
+def _queue_run(api: MemoryAPI, args: dict[str, Any]) -> dict[str, Any]:
+    if args.get("status_only"):
+        return {"ran": False, "stats": api.queue_stats()}
+    limit = args.get("limit")
+    report = api.queue_run(limit=int(limit) if limit is not None else None)
+    return {"ran": True, **report}
+
+
 def _get_asset(api: MemoryAPI, args: dict[str, Any]) -> dict[str, Any]:
     payload = api.get_asset(args["asset_id"], with_derived=bool(args.get("with_derived")))
     if payload is None:
@@ -529,6 +632,9 @@ HANDLERS: dict[str, Callable[[MemoryAPI, dict[str, Any]], dict[str, Any]]] = {
     "memory_merge": _merge,
     "memory_delete": _delete,
     "memory_store_asset": _store_asset,
+    "memory_ingest": _ingest,
+    "memory_search_segments": _search_segments,
+    "memory_queue_run": _queue_run,
     "memory_get_asset": _get_asset,
     "memory_replace_asset": _replace_asset,
     "memory_delete_asset": _delete_asset,
@@ -543,6 +649,7 @@ READ_ONLY_TOOLS = frozenset(
         "memory_get",
         "memory_get_related",
         "memory_get_asset",
+        "memory_search_segments",
         "memory_stats",
     }
 )

@@ -444,6 +444,24 @@ class TestQueueDurability:
         assert api.queue_purge(keep_days=0)["removed"] == 0
         assert api.queue_stats()["pending"] == 1
 
+    def test_iter_ready_inspects_without_claiming(self, api: MemoryAPI, tmp_path: Path) -> None:
+        """Inspection must not consume: listing ready work twice is stable."""
+        api.ingest(notes(tmp_path), defer=True)
+        first = [t.id for t in workqueue.iter_ready(api.conn)]
+        second = [t.id for t in workqueue.iter_ready(api.conn)]
+        assert first == second and len(first) == 1
+        assert workqueue.get(api.conn, first[0]).attempts == 0  # type: ignore[union-attr]
+
+    def test_iter_ready_hides_a_backed_off_task(self, api: MemoryAPI, tmp_path: Path) -> None:
+        api.ingest(notes(tmp_path), defer=True)
+        task = workqueue.listing(api.conn)[0]
+        api.conn.execute(
+            "UPDATE work_queue SET not_before = '2999-01-01T00:00:00Z' WHERE id = ?",
+            (task.id,),
+        )
+        api.conn.commit()
+        assert list(workqueue.iter_ready(api.conn)) == []
+
     def test_an_unknown_task_kind_fails_loudly(self, api: MemoryAPI) -> None:
         workqueue.enqueue(api.conn, kind="not_a_real_kind", payload={})
         report = api.queue_run()

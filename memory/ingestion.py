@@ -36,15 +36,6 @@ from .processors.base import ProcessContext, Processor, ProcessResult
 if TYPE_CHECKING:
     from .api import MemoryAPI
 
-#: Which ``data/derived/`` subtree a processor's output belongs in. The
-#: processor names its output kind; this maps it onto the three directories
-#: ``paths.derived_dir`` accepts.
-KIND_DIRS: dict[str, str] = {
-    "transcript": "transcripts",
-    "description": "descriptions",
-    "keyframe": "keyframes",
-}
-
 TASK_PROCESS = "process_asset"
 
 
@@ -516,7 +507,6 @@ def ingest_directory(
 
 
 __all__ = [
-    "KIND_DIRS",
     "TASK_PROCESS",
     "IngestResult",
     "IngestionError",
