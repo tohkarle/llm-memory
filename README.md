@@ -15,6 +15,10 @@ uv tool install git+https://github.com/tohkarle/llm-memory
 mem install --all
 ```
 
+Setting this up as an agent in a sandbox? [**INSTALL-AGENT.md**](INSTALL-AGENT.md)
+is written for you: the same steps, plus how to verify the result from the JSON
+and the failures you are most likely to hit.
+
 `mem install` is the bootstrap, and it is **idempotent** — safe to re-run from
 a provisioning script or a Dockerfile. `--all` does four things:
 

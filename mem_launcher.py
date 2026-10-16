@@ -109,14 +109,17 @@ def run_mcp() -> None:
     _require_package("mem-mcp")
     try:
         from memory.mcp_server import main as mcp_main
-    except ModuleNotFoundError as exc:
-        if exc.name and exc.name.split(".")[0] == "mcp":
-            sys.exit(
-                "mem-mcp: the MCP server needs the 'mcp' extra.\n"
-                "\n"
-                "    uv pip install 'personal-ai-memory[mcp]'\n"
-            )
-        raise
+    except ImportError as exc:
+        # memory.mcp_server already turns a missing or incompatible `mcp`
+        # into an actionable message, but a console script that lets it
+        # propagate prints a traceback -- which is what an agent reads, and
+        # a traceback buries the one line that says what to install. Catch
+        # ImportError (not just ModuleNotFoundError): the module re-raises a
+        # hand-built error whose `name` is None, so dispatching on `exc.name`
+        # misses it. stderr, because stdout is the client's transport.
+        sys.exit(
+            f"mem-mcp: {exc}\n\nInstall the extra:\n    uv pip install 'personal-ai-memory[mcp]'\n"
+        )
 
     mcp_main()
 

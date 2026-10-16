@@ -469,3 +469,38 @@ def test_cli_doctor_reports_agent_skills(runner: CliRunner, tmp_path: Path) -> N
     result = runner.invoke(main, ["--root", str(root), "doctor"], catch_exceptions=False)
     assert result.exit_code == 0, result.output
     assert "agent_skills" in json.loads(result.stdout)["data"]
+
+
+# ---------------------------------------------------------------- mem-mcp shim
+
+
+def test_mem_mcp_reports_the_missing_extra_without_a_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An agent reads the error; a traceback buries the line that fixes it.
+
+    ``memory.mcp_server`` raises a hand-built ``ModuleNotFoundError`` whose
+    ``name`` is None, so a shim dispatching on ``exc.name`` misses it and
+    lets the traceback through. Pin the catch.
+    """
+    import builtins
+
+    import mem_launcher
+
+    real_import = builtins.__import__
+
+    def fake_import(name: str, *args: Any, **kw: Any) -> Any:
+        if name == "memory.mcp_server":
+            raise ModuleNotFoundError(
+                "the MCP server needs the optional 'mcp' extra: uv sync --extra mcp"
+            )
+        return real_import(name, *args, **kw)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+
+    with pytest.raises(SystemExit) as caught:
+        mem_launcher.run_mcp()
+
+    message = str(caught.value)
+    assert "mcp" in message
+    assert "uv pip install" in message
