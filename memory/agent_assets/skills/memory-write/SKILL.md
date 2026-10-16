@@ -1,7 +1,7 @@
 ---
 name: memory-write
 description: Record, correct, or remove durable memories about the user. Use when they state a standing preference or fact, make a decision worth keeping, describe a reusable procedure, correct something recorded earlier, or say "remember this", "forget that", "I changed my mind". Also after substantial work whose outcome should outlive the conversation.
-x-memory-version: 0.1.0
+x-memory-version: 0.1.1
 ---
 
 # Writing memory
@@ -174,6 +174,17 @@ mem ingest ./notes/ --recursive --tag research
 `asset add` stores bytes. **`ingest` also extracts searchable text** —
 transcript, PDF/docx text, OCR — and indexes it as segments with locators.
 Prefer `ingest` unless you only need the file attached.
+
+**A long document goes through `ingest`, not through you.** Do not read one
+into your own context to store it, and do not hand-write a pile of `create`
+calls from it: that spends your context on text the extractor handles, and
+produces memories no one can trace back to a page. Save it to a file, ingest
+the file, then `create` only the few durable claims it settles — each with
+`--source document:<name>` so the segment is still there to cite. Segments
+hold the text; memories hold the judgment.
+
+If the content arrived as pasted text rather than a path, write it to a file
+first and ingest that.
 
 Type detection reads magic numbers, so a mislabelled extension is handled.
 Override with `--media-type`. `--param KEY=VALUE` tunes the processor

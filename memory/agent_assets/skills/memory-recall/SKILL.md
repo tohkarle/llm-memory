@@ -1,7 +1,7 @@
 ---
 name: memory-recall
 description: Look up what is already known about the user before answering. Use when the request touches their preferences, history, prior decisions, people, projects, or tools; at the start of any task where prior context would change the answer; and whenever they say "remember when", "as I mentioned", "my usual", "like last time", or refer to something as already settled.
-x-memory-version: 0.1.0
+x-memory-version: 0.1.1
 ---
 
 # Recalling memory
