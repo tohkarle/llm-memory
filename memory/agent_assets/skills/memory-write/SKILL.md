@@ -1,6 +1,7 @@
 ---
 name: memory-write
 description: Record, correct, or remove durable memories about the user. Use when they state a standing preference or fact, make a decision worth keeping, describe a reusable procedure, correct something recorded earlier, or say "remember this", "forget that", "I changed my mind". Also after substantial work whose outcome should outlive the conversation.
+x-memory-version: 0.1.0
 ---
 
 # Writing memory

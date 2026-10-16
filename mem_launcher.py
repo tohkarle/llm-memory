@@ -70,26 +70,55 @@ def _editable_roots(site_dir: Path) -> list[Path]:
     return roots
 
 
+def _require_package(prog: str) -> None:
+    """Repair sys.path, or exit with the fix if the package is truly absent."""
+    if ensure_importable():
+        return
+    try:
+        import memory  # noqa: F401
+    except ModuleNotFoundError:
+        sys.exit(
+            f"{prog}: cannot import the 'memory' package.\n"
+            "\n"
+            "This happens when an editable install's .pth path hook was "
+            "not honored -- on macOS, installers may write it with the "
+            "UF_HIDDEN flag, which CPython >= 3.12 skips.\n"
+            "\n"
+            "Fix with a regular install:\n"
+            "    uv pip install .\n"
+            "or run it through the project environment instead:\n"
+            "    uv run python -m memory --help\n"
+        )
+
+
 def run() -> None:
-    if not ensure_importable():
-        try:
-            import memory  # noqa: F401
-        except ModuleNotFoundError:
-            sys.exit(
-                "mem: cannot import the 'memory' package.\n"
-                "\n"
-                "This happens when an editable install's .pth path hook was "
-                "not honored -- on macOS, installers may write it with the "
-                "UF_HIDDEN flag, which CPython >= 3.12 skips.\n"
-                "\n"
-                "Fix with a regular install:\n"
-                "    uv pip install .\n"
-                "or run it through the project environment instead:\n"
-                "    uv run python -m memory --help\n"
-            )
+    _require_package("mem")
     from memory.cli import main
 
     main()
+
+
+def run_mcp() -> None:
+    """Entry point for the ``mem-mcp`` script: the stdio MCP server.
+
+    Separate from ``mem`` so an MCP client config can name a command rather
+    than an interpreter path. The ``mcp`` extra is optional, so a missing
+    dependency is reported here as the install that fixes it -- on stderr,
+    because stdout is the client's transport and must stay clean.
+    """
+    _require_package("mem-mcp")
+    try:
+        from memory.mcp_server import main as mcp_main
+    except ModuleNotFoundError as exc:
+        if exc.name and exc.name.split(".")[0] == "mcp":
+            sys.exit(
+                "mem-mcp: the MCP server needs the 'mcp' extra.\n"
+                "\n"
+                "    uv pip install 'personal-ai-memory[mcp]'\n"
+            )
+        raise
+
+    mcp_main()
 
 
 if __name__ == "__main__":  # pragma: no cover

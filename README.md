@@ -6,15 +6,70 @@ Local-first memory system for LLM agents. No cloud, no server, no vector databas
 frontmatter under `data/memories/`. SQLite is a rebuildable index for search and
 relationships — delete `data/index/memory.sqlite` at any time and run `mem rebuild`.
 
+## Install
+
+Any machine or sandbox, no checkout required:
+
+```bash
+uv tool install git+https://github.com/tohkarle/personal-ai-memory
+mem install --all
+```
+
+`mem install` is the bootstrap, and it is **idempotent** — safe to re-run from
+a provisioning script or a Dockerfile. `--all` does four things:
+
+| Step | What it does |
+| --- | --- |
+| `root` | Creates and indexes the data tree (default `~/.memory`) |
+| `skills` | Copies the bundled agent skills into `~/.claude/skills/` |
+| `mcp` | Registers the MCP server in `~/.claude/settings.json` |
+| `shell_env` | Exports `MEMORY_ROOT` from your shell profile |
+
+Each step is opt-in individually (`--skills`, `--mcp`, `--shell-env`); only the
+data root always runs. `--dry-run` reports what would change and writes
+nothing. Output is JSON like every other command, so a calling agent can
+verify the result rather than trusting the exit code:
+
+```bash
+mem --root /workspace/memory install --skills --mcp --dry-run
+```
+
+The MCP registration merges into `settings.json` rather than replacing it, and
+a malformed existing file is reported as an error instead of being
+overwritten. The shell export is written between markers, so a re-run replaces
+its own block instead of stacking another copy.
+
+### Agent skills
+
+The two skills under `memory/agent_assets/skills/` are the agent-facing half of
+this system — the CLI is useless to a model that does not know when to reach
+for it. They ship **inside the wheel**, so installing the package and
+installing the agent's instructions are one act. Each carries an
+`x-memory-version` stamp, and `mem doctor` reports whether the installed copies
+are current:
+
+```bash
+mem doctor | jq .data.agent_skills
+mem install --skills          # install or refresh; --force to overwrite
+```
+
+This repository's `.claude/skills` is a symlink to that directory, so the copy
+being dogfooded and the copy being shipped cannot drift apart.
+
+### Optional dependencies
+
+The core install needs none. `--profile` names a set and reports the command
+rather than installing into the interpreter it is running from:
+
+```bash
+mem install --profile minimal   # core only — the sandbox default
+mem install --profile text      # + pypdf, python-docx, Pillow
+mem install --profile full      # + transcription, OCR, MCP, tokenizer
+```
+
 ## Quick start
 
 ```bash
-uv sync --extra dev        # dependencies and test tooling
-uv pip install .           # installs the `mem` command
-```
-
-```bash
-mem init
 mem create --type preference --title "Prefers uv over pip" \
   --body "Uses uv for all Python projects." --profile --tag tooling
 mem search "uv"
@@ -24,22 +79,8 @@ mem segment search "packaging"
 mem doctor
 ```
 
-Set `MEMORY_ROOT`, or pass `--root PATH`, to choose the data directory.
-
-### If `mem` reports "No module named 'memory'"
-
-`uv sync` installs this project in editable mode, which relies on a `.pth`
-path hook in site-packages. On macOS, installers may write that file with the
-`UF_HIDDEN` filesystem flag, and CPython 3.12+ skips hidden `.pth` files
-outright — so the package imports fine inside the project directory, where
-the CWD is already on the path, but the installed `mem` script fails
-anywhere else.
-
-`uv pip install .` (above) avoids the hook by installing real files, and
-`mem doctor` reports `install.warning` when it detects the condition. Within
-the project you can always use `uv run python -m memory …` instead. Note that
-a later `uv sync` reverts to editable mode and undoes this; re-run
-`uv pip install .` if `mem` stops resolving.
+`MEMORY_ROOT` selects the data directory. Note that `--root` is a group-level
+option, so it goes **before** the subcommand: `mem --root PATH install`.
 
 ## Multimodal ingestion
 
@@ -172,7 +213,8 @@ provider, `--llm` degrades to the deterministic path rather than failing.
 
 ## How agents use it
 
-Two skills in `.claude/skills/` teach any agent the system:
+Two skills teach any agent the system. They ship inside the wheel and
+`mem install --skills` copies them to `~/.claude/skills/`:
 
 - **memory-recall** — when and how to look things up.
 - **memory-write** — what to record, and which mutation verb to use.
@@ -181,8 +223,8 @@ The CLI emits a JSON envelope on stdout (`{"ok": true, "data": {...}}`); logs go
 stderr. `mem context --format markdown` is the one command that prints prose, because
 it is meant to be pasted into a prompt.
 
-An optional MCP server (`uv sync --extra mcp`) exposes the same 18 operations
-to MCP clients over stdio: `python -m memory.mcp_server`. That includes
+An optional MCP server (`mem install --mcp`, with the `mcp` extra) exposes the
+same 18 operations to MCP clients over stdio via the `mem-mcp` command. That includes
 `memory_ingest`, `memory_search_segments` and `memory_queue_run`, so a client
 can extract and search inside media rather than only storing it. Set `MEMORY_ROOT` to
 choose the data directory. Destructive tools are annotated as such, and
@@ -228,9 +270,30 @@ Set `$MEMORY_ROOT` or pass `--root` to use a data directory elsewhere.
 ## Development
 
 ```bash
+uv sync --extra dev        # dependencies and test tooling
+uv pip install .           # installs the `mem` and `mem-mcp` commands
+```
+
+```bash
 uv run pytest                        # full suite
 uv run mypy                          # strict, configured in pyproject
 uv run ruff check . && uv run ruff format --check .
 uv run python -m memory doctor       # environment + index health
 uv run python -m memory verify       # filesystem vs. index divergence
 ```
+
+### If `mem` reports "No module named 'memory'"
+
+`uv sync` installs this project in editable mode, which relies on a `.pth`
+path hook in site-packages. On macOS, installers may write that file with the
+`UF_HIDDEN` filesystem flag, and CPython 3.12+ skips hidden `.pth` files
+outright — so the package imports fine inside the project directory, where
+the CWD is already on the path, but the installed `mem` script fails
+anywhere else.
+
+`uv pip install .` (above) avoids the hook by installing real files, and
+`mem doctor` reports `install.warning` when it detects the condition. Within
+the project you can always use `uv run python -m memory …` instead. Note that
+a later `uv sync` reverts to editable mode and undoes this; re-run
+`uv pip install .` if `mem` stops resolving.
+

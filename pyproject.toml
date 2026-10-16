@@ -15,6 +15,10 @@ dependencies = [
 
 [project.scripts]
 mem = "mem_launcher:run"
+# A second console script so an MCP client config can name a command instead
+# of an interpreter plus `-m`: the path to the right Python is exactly what a
+# sandbox gets wrong, and `mem install --mcp` writes this name.
+mem-mcp = "mem_launcher:run_mcp"
 
 # This package publishes its own processors through the same entry point group
 # third-party processors use. They are also registered directly at import, so
@@ -72,6 +76,11 @@ dev = [
 [tool.hatch.build.targets.wheel]
 packages = ["memory"]
 only-include = ["memory", "mem_launcher.py"]
+# The bundled skills are data, not modules, so they are not picked up by
+# package discovery. They are what makes the install useful to an agent, so
+# a wheel without them is a broken wheel -- `tests/test_install.py` asserts
+# they are present.
+artifacts = ["memory/agent_assets/skills/**/*.md"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "mem_launcher.py" = "mem_launcher.py"

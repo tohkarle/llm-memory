@@ -25,6 +25,7 @@ from typing import Any
 import click
 
 from . import __version__
+from . import install as install_mod
 from .api import MemoryAPI
 from .journal import LockTimeout
 from .models import (
@@ -112,6 +113,10 @@ def classify(exc: Exception) -> CliError:
             EXIT_LOCKED,
             hint="another process is writing; retry shortly",
         )
+    if isinstance(exc, install_mod.InstallError):
+        # A step the user has to resolve (malformed settings.json, a partial
+        # env block), not an internal fault.
+        return CliError("install_failed", str(exc), EXIT_VALIDATION)
     if isinstance(exc, RootNotFound):
         return CliError("no_root", str(exc), EXIT_NOT_FOUND, hint="run `mem init`")
     if isinstance(exc, ValueError):
@@ -340,6 +345,61 @@ def init(ctx: click.Context, force: bool) -> None:
             api.close()
 
     run("init", action)
+
+
+@main.command(name="install")
+@click.option(
+    "--skills/--no-skills",
+    default=False,
+    help="Copy the bundled agent skills into the agent config directory.",
+)
+@click.option("--mcp", is_flag=True, help="Register the MCP server in settings.json.")
+@click.option("--shell-env", is_flag=True, help="Export MEMORY_ROOT from your shell profile.")
+@click.option("--all", "all_steps", is_flag=True, help="Shorthand for --skills --mcp --shell-env.")
+@click.option(
+    "--agent-dir",
+    type=click.Path(path_type=Path),
+    help="Agent config directory [default: ~/.claude].",
+)
+@click.option(
+    "--profile",
+    type=click.Choice(sorted(install_mod.PROFILES)),
+    default="minimal",
+    show_default=True,
+    help="Which optional dependency set to recommend.",
+)
+@click.option("--force", is_flag=True, help="Overwrite skills even if current.")
+@click.option("--dry-run", is_flag=True, help="Report what would change; write nothing.")
+@click.pass_context
+def install_cmd(
+    ctx: click.Context,
+    skills: bool,
+    mcp: bool,
+    shell_env: bool,
+    all_steps: bool,
+    agent_dir: Path | None,
+    profile: str,
+    force: bool,
+    dry_run: bool,
+) -> None:
+    """Finish the install: data root, agent skills, MCP wiring, shell env.
+
+    Idempotent -- safe to re-run from a provisioning script.
+    """
+
+    def action() -> dict[str, Any]:
+        return install_mod.install(
+            root=ctx.obj.get("root"),
+            agent_dir=agent_dir,
+            skills=skills or all_steps,
+            mcp=mcp or all_steps,
+            shell_env=shell_env or all_steps,
+            profile=profile,
+            force=force,
+            dry_run=dry_run,
+        )
+
+    run("install", action)
 
 
 @main.command()
@@ -978,9 +1038,14 @@ def doctor(ctx: click.Context) -> None:
     def action() -> dict[str, Any]:
         api = open_api(ctx, read_only=True)
         try:
-            return api.doctor()
+            report = api.doctor()
         finally:
             api.close()
+        # Whether the agent-facing half of the install is present and current.
+        # Lives here rather than in the API because it inspects the agent's
+        # config directory, which is not part of a memory root.
+        report["agent_skills"] = install_mod.skills_health()
+        return report
 
     run("doctor", action)
 
