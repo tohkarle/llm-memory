@@ -44,6 +44,12 @@ DEFAULT_ROOT = Path("~/.memory")
 #: MCP servers from ``<dir>/settings.json``.
 DEFAULT_AGENT_DIR = Path("~/.claude")
 
+#: Overrides the agent config directory, the way ``$MEMORY_ROOT`` overrides
+#: the data root. An agent confined to its working directory installs skills
+#: there with ``--agent-dir``, and without this every later command would go
+#: back to looking under ``$HOME`` and report them missing.
+AGENT_DIR_ENV_VAR = "MEMORY_AGENT_DIR"
+
 #: Name the MCP server is registered under in ``settings.json``.
 MCP_SERVER_NAME = "memory"
 
@@ -74,6 +80,20 @@ PROFILES: dict[str, tuple[str, ...]] = {
 
 class InstallError(RuntimeError):
     """A step could not be completed."""
+
+
+def resolve_agent_dir(agent_dir: Path | None = None) -> Path:
+    """Where the agent reads its skills and settings from.
+
+    Order mirrors root discovery: an explicit argument wins, then
+    ``$MEMORY_AGENT_DIR``, then ``~/.claude``.
+    """
+    if agent_dir is not None:
+        return agent_dir.expanduser().resolve()
+    env = os.environ.get(AGENT_DIR_ENV_VAR)
+    if env:
+        return Path(env).expanduser().resolve()
+    return DEFAULT_AGENT_DIR.expanduser()
 
 
 @dataclass
@@ -385,7 +405,7 @@ def install(
         raise InstallError(f"unknown profile {profile!r}; choose from {', '.join(PROFILES)}")
 
     resolved_root = (root or DEFAULT_ROOT).expanduser().resolve()
-    resolved_agent = (agent_dir or DEFAULT_AGENT_DIR).expanduser()
+    resolved_agent = resolve_agent_dir(agent_dir)
     resolved_home = home or Path.home()
 
     steps: list[Step] = [install_root(resolved_root, dry_run=dry_run)]
@@ -412,6 +432,19 @@ def install(
     if not dry_run and not shell_env and os.environ.get(ENV_VAR) != str(resolved_root):
         warnings.append(f"{ENV_VAR} is not set to {resolved_root}; pass --root or export it")
 
+    # Same for a non-default agent dir: later commands look under $HOME
+    # unless told otherwise, which would report the skills as missing.
+    if (
+        not dry_run
+        and skills
+        and resolved_agent != DEFAULT_AGENT_DIR.expanduser()
+        and os.environ.get(AGENT_DIR_ENV_VAR) != str(resolved_agent)
+    ):
+        warnings.append(
+            f"{AGENT_DIR_ENV_VAR} is not set to {resolved_agent}; "
+            f"export it so later commands find these skills"
+        )
+
     return {
         "version": __version__,
         "root": str(resolved_root),
@@ -434,7 +467,7 @@ def skills_health(agent_dir: Path | None = None) -> dict[str, Any]:
     is a thing the user should be told about, with the one command that fixes
     it.
     """
-    dest_root = (agent_dir or DEFAULT_AGENT_DIR).expanduser() / "skills"
+    dest_root = resolve_agent_dir(agent_dir) / "skills"
     entries: dict[str, Any] = {}
     stale: list[str] = []
     for name in SKILL_NAMES:

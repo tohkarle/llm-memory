@@ -8,7 +8,23 @@ Read this if you have no memory system installed, or `mem` is not on `PATH`.
 
 ---
 
-## 1. Install
+## 0. First: are you allowed to write outside your working directory?
+
+This matters before you run anything. `mem install --all` writes to four
+places, and three are under `$HOME`: the data root (`~/.memory`), the skills
+(`~/.claude/skills/`), the MCP entry (`~/.claude/settings.json`), and your
+shell profile.
+
+**If you are confined to a working directory, or are not permitted to modify
+your harness's configuration — which includes `~/.claude/` — do not run
+`--all`.** That is the correct call, not an obstacle to work around. Use
+[§1b, the confined install](#1b-confined-install-working-directory-only)
+instead. It is fully supported and gives you a working memory system.
+
+Use §1 only if you can write to `$HOME` freely — a container you own, a
+provisioning script, or a human's shell.
+
+## 1. Install (unrestricted)
 
 ```bash
 uv tool install git+https://github.com/tohkarle/llm-memory
@@ -16,7 +32,10 @@ mem install --all
 ```
 
 If `uv` is unavailable, `pip install git+https://github.com/tohkarle/llm-memory`
-works the same way. Python 3.12+ is required.
+works the same way. **Python 3.12+ is required** — check with
+`python3 --version` first, because `uv venv` may otherwise pick an older
+interpreter and the install will fail with an unsatisfiable-requirements
+error.
 
 `mem install --all` does four things, and is **idempotent** — re-run it freely,
 including from a provisioning script:
@@ -30,6 +49,40 @@ including from a provisioning script:
 
 Run `mem install` with no flags to get only the data root. Use `--dry-run`
 first if you want to see what would change without writing anything.
+
+## 1b. Confined install (working directory only)
+
+Everything stays inside the working directory. Nothing is written under
+`$HOME`, and your harness's configuration is left alone.
+
+```bash
+# 1. A virtual environment here, on Python 3.12+.
+uv venv .venv --python 3.12
+uv pip install --python .venv/bin/python \
+  "personal-ai-memory @ git+https://github.com/tohkarle/llm-memory"
+
+# 2. Data root and skills, both local. No MCP, no shell edit.
+.venv/bin/mem --root ./.memory install --skills --agent-dir ./.claude
+
+# 3. Make both locations stick for every later command.
+export MEMORY_ROOT="$PWD/.memory"
+export MEMORY_AGENT_DIR="$PWD/.claude"
+```
+
+Then use `.venv/bin/mem` (or add `.venv/bin` to `PATH`). Read the two skills
+at `./.claude/skills/*/SKILL.md` and follow them yourself — they will not be
+auto-registered by your harness, so apply them manually.
+
+**Export `MEMORY_AGENT_DIR`.** Without it, `mem doctor` looks under `$HOME`,
+finds nothing, and reports the skills as missing even though they are
+installed. `mem install` warns you if you forget.
+
+If `uv` writes its cache to `$HOME` and that is blocked too, set
+`UV_CACHE_DIR="$PWD/.uv-cache"` before installing. A pre-existing
+`python3.12` avoids the download entirely.
+
+Everything else in this guide applies unchanged, except that `--root` and the
+local `mem` path are yours to supply.
 
 ## 2. Confirm it worked
 
@@ -138,6 +191,8 @@ it, then re-run.
 - **Do not store secrets.** This is plain Markdown on disk. Memories can be
   marked secret so they stay out of `mem tags` and default search results,
   but that is hygiene, not encryption.
-- **Do not point `MEMORY_ROOT` at a scratch directory** that gets wiped
-  between sessions. The default `~/.memory` is outside any checkout on
-  purpose: a corpus deleted with the working directory defeats the point.
+- **Do not point `MEMORY_ROOT` at a directory that gets wiped** between
+  sessions. The default `~/.memory` sits outside any checkout on purpose. A
+  root inside the working directory (§1b) is correct when that is all you can
+  write to — but say so plainly, because the corpus then lives and dies with
+  that directory.

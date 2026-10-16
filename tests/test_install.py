@@ -504,3 +504,89 @@ def test_mem_mcp_reports_the_missing_extra_without_a_traceback(
     message = str(caught.value)
     assert "mcp" in message
     assert "uv pip install" in message
+
+
+# ---------------------------------------------------------------- confined installs
+
+
+def test_agent_dir_env_var_is_honored(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A sandboxed install's skill location must survive into later commands.
+
+    Without this, `mem doctor` looks under $HOME, finds nothing, and reports
+    skills missing that are installed -- which sends an agent into a loop
+    re-installing them.
+    """
+    agent = tmp_path / "workdir" / ".claude"
+    monkeypatch.setenv(install_mod.AGENT_DIR_ENV_VAR, str(agent))
+
+    result = install(root=tmp_path / "root", skills=True, home=tmp_path)
+    assert result["agent_dir"] == str(agent)
+
+    health = skills_health()
+    assert health["dir"] == str(agent / "skills")
+    assert all(s["current"] for s in health["skills"].values())
+    assert "hint" not in health
+
+
+def test_explicit_agent_dir_beats_the_env_var(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(install_mod.AGENT_DIR_ENV_VAR, str(tmp_path / "from-env"))
+    explicit = tmp_path / "explicit"
+    result = install(root=tmp_path / "root", agent_dir=explicit, skills=True, home=tmp_path)
+    assert result["agent_dir"] == str(explicit)
+
+
+def test_non_default_agent_dir_warns_to_export_it(tmp_path: Path) -> None:
+    """The warning is what tells an agent how to make the location stick."""
+    result = install(
+        root=tmp_path / "root",
+        agent_dir=tmp_path / "workdir" / ".claude",
+        skills=True,
+        home=tmp_path,
+    )
+    assert any(install_mod.AGENT_DIR_ENV_VAR in w for w in result["warnings"])
+
+
+def test_workdir_only_install_writes_nothing_under_home(tmp_path: Path) -> None:
+    """The sandboxed case: an agent confined to its working directory.
+
+    Everything the install touches must land in the workdir -- no data root,
+    no skills, no settings and no profile edit under $HOME.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+
+    install(
+        root=workdir / ".memory",
+        agent_dir=workdir / ".claude",
+        skills=True,
+        home=home,
+    )
+
+    assert list(home.iterdir()) == [], "install wrote under $HOME"
+    assert Paths(workdir / ".memory").marker.exists()
+    for name in SKILL_NAMES:
+        assert (workdir / ".claude" / "skills" / name / "SKILL.md").is_file()
+
+
+def test_cli_doctor_accepts_an_agent_dir(runner: CliRunner, tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    agent = tmp_path / "wd" / ".claude"
+    assert runner.invoke(main, ["--root", str(root), "init"]).exit_code == 0
+    assert (
+        runner.invoke(
+            main, ["--root", str(root), "install", "--skills", "--agent-dir", str(agent)]
+        ).exit_code
+        == 0
+    )
+
+    result = runner.invoke(
+        main, ["--root", str(root), "doctor", "--agent-dir", str(agent)], catch_exceptions=False
+    )
+    assert result.exit_code == 0, result.output
+    health = json.loads(result.stdout)["data"]["agent_skills"]
+    assert health["dir"] == str(agent / "skills")
+    assert all(s["current"] for s in health["skills"].values())

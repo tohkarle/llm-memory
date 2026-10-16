@@ -359,7 +359,8 @@ def init(ctx: click.Context, force: bool) -> None:
 @click.option(
     "--agent-dir",
     type=click.Path(path_type=Path),
-    help="Agent config directory [default: ~/.claude].",
+    envvar=install_mod.AGENT_DIR_ENV_VAR,
+    help="Agent config directory [default: $MEMORY_AGENT_DIR or ~/.claude].",
 )
 @click.option(
     "--profile",
@@ -1031,8 +1032,14 @@ def verify(ctx: click.Context) -> None:
 
 
 @main.command()
+@click.option(
+    "--agent-dir",
+    type=click.Path(path_type=Path),
+    envvar=install_mod.AGENT_DIR_ENV_VAR,
+    help="Agent config directory to check [default: $MEMORY_AGENT_DIR or ~/.claude].",
+)
 @click.pass_context
-def doctor(ctx: click.Context) -> None:
+def doctor(ctx: click.Context, agent_dir: Path | None) -> None:
     """Environment and index health."""
 
     def action() -> dict[str, Any]:
@@ -1044,7 +1051,7 @@ def doctor(ctx: click.Context) -> None:
         # Whether the agent-facing half of the install is present and current.
         # Lives here rather than in the API because it inspects the agent's
         # config directory, which is not part of a memory root.
-        report["agent_skills"] = install_mod.skills_health()
+        report["agent_skills"] = install_mod.skills_health(agent_dir)
         return report
 
     run("doctor", action)
