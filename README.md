@@ -301,3 +301,6 @@ the project you can always use `uv run python -m memory …` instead. Note that
 a later `uv sync` reverts to editable mode and undoes this; re-run
 `uv pip install .` if `mem` stops resolving.
 
+## License
+
+MIT — see [LICENSE](LICENSE).
