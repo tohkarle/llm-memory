@@ -1,7 +1,7 @@
 ---
 name: memory-write
 description: Record, correct, or remove durable memories about the user. Use when they state a standing preference or fact, make a decision worth keeping, describe a reusable procedure, correct something recorded earlier, or say "remember this", "forget that", "I changed my mind". Also after substantial work whose outcome should outlive the conversation.
-x-memory-version: 0.1.1
+x-memory-version: 0.1.2
 ---
 
 # Writing memory
@@ -12,6 +12,42 @@ x-memory-version: 0.1.1
 - Meaning changed → `replace`
 - Duplicates found → `merge`
 - Wrong or unwanted → `delete`
+
+## First: is this worth recording at all?
+
+Most of a conversation is not. A corpus that records everything becomes one
+nobody can search: every recall returns forty near-duplicates, and the
+signal you needed is ranked alongside the moment you needed it.
+
+**The test: would this change how you act weeks from now, in a conversation
+that has nothing to do with this one?**
+
+Record:
+
+- a standing preference or constraint ("always squash-merge", "never deploy on Friday")
+- a decision and its reasoning — especially one that was argued over
+- a fact about them, their systems, or their people that is not in the repo
+- a procedure that took effort to work out
+- a correction to something already recorded
+
+Do not record:
+
+- anything the code, tests, README or git history already says — that is not
+  memory, it is a stale copy of the repo
+- the narrative of this session: what you tried, which command failed, what
+  you are about to do next
+- a restatement of a document you ingested; `ingest` already made it
+  searchable, and a memory should carry what it *settles*, not its contents
+- one-off task parameters ("use port 8080 for this test")
+- anything you are recording so you look diligent
+
+**When unsure, don't.** A missing memory costs one question later. A wrong or
+noisy one gets recalled and acted on — and the skill that reads it cannot
+tell it was never worth writing.
+
+Volume is a signal: a normal working session produces **zero to three**
+memories. If you are about to write the eighth, you are narrating, not
+remembering.
 
 ## Pick the type deliberately
 
