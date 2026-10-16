@@ -13,6 +13,11 @@ dependencies = [
     "click>=8.1",
 ]
 
+[project.urls]
+Homepage = "https://github.com/tohkarle/llm-memory"
+Repository = "https://github.com/tohkarle/llm-memory"
+Issues = "https://github.com/tohkarle/llm-memory/issues"
+
 [project.scripts]
 mem = "mem_launcher:run"
 # A second console script so an MCP client config can name a command instead

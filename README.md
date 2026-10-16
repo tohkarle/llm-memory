@@ -11,7 +11,7 @@ relationships — delete `data/index/memory.sqlite` at any time and run `mem reb
 Any machine or sandbox, no checkout required:
 
 ```bash
-uv tool install git+https://github.com/tohkarle/personal-ai-memory
+uv tool install git+https://github.com/tohkarle/llm-memory
 mem install --all
 ```
 
