@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from collections.abc import Iterator
 from pathlib import Path
@@ -380,3 +381,105 @@ def test_budget_is_never_exceeded_property(tmp_path_factory: Any, budget: int) -
         assert sum(b.tokens for b in result.blocks) <= budget
     finally:
         api.close()
+
+
+class TestStaleBodyRefresh:
+    """An edit made outside the API must not surface as a stale context block.
+
+    Bodies are served from the index, so these tests go behind it: they write
+    the file directly, exactly as a hand edit, a `git pull` or a sync tool
+    would, and assert the read path notices.
+    """
+
+    @staticmethod
+    def _rewrite_file(api: MemoryAPI, mid: str, body: str) -> Path:
+        """Replace a memory's body on disk, leaving the index untouched."""
+        path = api.store.locate(mid)
+        assert path is not None
+        text = path.read_text(encoding="utf-8")
+        head, sep, _ = text.partition("\n---\n")
+        assert sep, "expected frontmatter"
+        path.write_text(f"{head}{sep}\n{body}\n", encoding="utf-8")
+        # Guarantee a distinguishable mtime even on a coarse clock.
+        stat = path.stat()
+        os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000))
+        return path
+
+    def test_outside_edit_reaches_the_context_pack(self, api: MemoryAPI) -> None:
+        memory = seed(api, title="Packaging tool", body="Original body about pip.")
+        self._rewrite_file(api, memory.id, "Rewritten body about uv.")
+
+        result = api.get_context("packaging tool")
+
+        assert "Rewritten body about uv." in result.markdown
+        assert "Original body about pip." not in result.markdown
+
+    def test_the_repair_is_persisted_to_the_index(self, api: MemoryAPI) -> None:
+        memory = seed(api, title="Packaging tool", body="Original body about pip.")
+        self._rewrite_file(api, memory.id, "Rewritten body about uv.")
+
+        api.get_context("packaging tool")
+
+        row = api.conn.execute("SELECT body FROM memories WHERE id = ?", (memory.id,)).fetchone()
+        assert row["body"] == "Rewritten body about uv."
+
+    def test_search_sees_the_refreshed_text_afterwards(self, api: MemoryAPI) -> None:
+        """The reindex rebuilds FTS too, so a term only in the new body matches.
+
+        No trailing punctuation on the probe term: the tokenizer's ``tokenchars``
+        include ``.``, so "sqlalchemy." and "sqlalchemy" are different tokens.
+        """
+        memory = seed(api, title="Packaging tool", body="Original body about pip.")
+        self._rewrite_file(api, memory.id, "Rewritten body mentioning sqlalchemy everywhere")
+
+        assert api.search("sqlalchemy") == []
+        api.get_context("packaging tool")
+
+        assert [h.memory_id for h in api.search("sqlalchemy")] == [memory.id]
+
+    def test_untouched_memories_are_not_rewritten(self, api: MemoryAPI) -> None:
+        memory = seed(api, title="Packaging tool", body="Original body about pip.")
+        before = api.conn.execute(
+            "SELECT mtime_ns, indexed_at FROM memories WHERE id = ?", (memory.id,)
+        ).fetchone()
+
+        api.get_context("packaging tool")
+
+        after = api.conn.execute(
+            "SELECT mtime_ns, indexed_at FROM memories WHERE id = ?", (memory.id,)
+        ).fetchone()
+        assert after["mtime_ns"] == before["mtime_ns"]
+        assert after["indexed_at"] == before["indexed_at"]
+
+    def test_a_deleted_file_does_not_break_the_read(self, api: MemoryAPI) -> None:
+        """A missing file is a verify-level problem, not a reason to fail a read."""
+        memory = seed(api, title="Packaging tool", body="Original body about pip.")
+        path = api.store.locate(memory.id)
+        assert path is not None
+        path.unlink()
+
+        result = api.get_context("packaging tool")
+
+        assert "Original body about pip." in result.markdown
+
+    def test_an_unparseable_file_falls_back_to_the_indexed_body(self, api: MemoryAPI) -> None:
+        memory = seed(api, title="Packaging tool", body="Original body about pip.")
+        path = api.store.locate(memory.id)
+        assert path is not None
+        path.write_text("this is not a memory file", encoding="utf-8")
+
+        result = api.get_context("packaging tool")
+
+        assert "Original body about pip." in result.markdown
+
+    def test_a_read_only_api_still_serves_fresh_text(self, tmp_path: Path) -> None:
+        writable = MemoryAPI.initialize(tmp_path)
+        try:
+            memory = seed(writable, title="Packaging tool", body="Original body about pip.")
+            self._rewrite_file(writable, memory.id, "Rewritten body about uv.")
+        finally:
+            writable.close()
+
+        with MemoryAPI(tmp_path, read_only=True) as reader:
+            result = reader.get_context("packaging tool")
+            assert "Rewritten body about uv." in result.markdown

@@ -32,6 +32,7 @@ from .models import (
     Sensitivity,
     SourceRef,
     Tombstone,
+    ValidationError,
     clean_entities,
     clean_tags,
     ensure_valid,
@@ -662,7 +663,13 @@ class MemoryAPI:
         filters: SearchFilters | None = None,
         **kwargs: Any,
     ) -> ContextResult:
-        """Assemble a token-budgeted context pack. See :mod:`memory.context`."""
+        """Assemble a token-budgeted context pack. See :mod:`memory.context`.
+
+        Bodies are served from the index, so this passes a refresher that
+        re-reads any file the index has fallen behind -- see
+        :meth:`_refresh_stale_bodies`.
+        """
+        kwargs.setdefault("refresh", self._refresh_stale_bodies)
         return get_context(
             self.conn,
             query,
@@ -670,6 +677,58 @@ class MemoryAPI:
             filters=filters,
             **kwargs,
         )
+
+    def _refresh_stale_bodies(self, candidates: list[tuple[str, str, int]]) -> dict[str, str]:
+        """Re-read the files whose index rows are behind them.
+
+        The filesystem is authoritative, but context assembly reads bodies from
+        the index, so an edit made outside this API would otherwise be invisible
+        on the one path where it matters most. ``candidates`` carries the stored
+        mtime for each block; a plain ``stat`` says which files have moved on.
+
+        Deliberately narrow: only rows this method proved stale are re-read,
+        and only their bodies are returned. A re-read that fails for any reason
+        leaves the indexed body in place -- a stale answer beats no answer, and
+        ``verify`` reports the divergence either way.
+        """
+        fresh: dict[str, str] = {}
+        repaired: list[str] = []
+
+        for mid, rel_path, indexed_mtime in candidates:
+            path = self.paths.data / rel_path
+            try:
+                current = path.stat().st_mtime_ns
+            except OSError:
+                continue
+            if current == indexed_mtime:
+                continue
+            try:
+                memory = self.store.read_path(path)
+            except (ValidationError, OSError, UnicodeDecodeError):
+                continue
+            if memory.id != mid:
+                continue
+            fresh[mid] = memory.body
+            repaired.append(mid)
+
+        # A read-only API cannot persist the repair -- not even a dirty mark,
+        # since that is itself a write -- but the caller still gets the correct
+        # text, which is the point. `verify` is what surfaces the divergence.
+        if repaired and not self.read_only:
+            try:
+                for mid in repaired:
+                    self._reindex_one(mid)
+                self.conn.commit()
+            except sqlite3.DatabaseError:
+                # The files already won; leave the stale rows for the next open
+                # rather than failing a read.
+                self.conn.rollback()
+                try:
+                    db.add_dirty(self.conn, repaired)
+                    self.conn.commit()
+                except sqlite3.DatabaseError:
+                    pass
+        return fresh
 
     def profile(self, *, limit: int = 50) -> list[Hit]:
         """Memories flagged as always-relevant."""

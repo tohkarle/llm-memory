@@ -181,17 +181,56 @@ def _make_block(hit: Hit, body: str, *, score: float, stage: Stage, reason: str)
     )
 
 
-def _bodies(conn: sqlite3.Connection, ids: list[str]) -> dict[str, str]:
+#: What :func:`get_context` accepts to repair rows that lag their files. It is
+#: handed ``(id, path, mtime_ns)`` triples -- paths exactly as the index stores
+#: them, relative to ``data/`` -- and returns fresh bodies for whichever it
+#: could re-read. Resolving those paths needs a root, which is why this is a
+#: callback from :meth:`memory.api.MemoryAPI.get_context` rather than a stat
+#: call here: this module holds a connection and nothing else.
+BodyRefresher = Callable[[list[tuple[str, str, int]]], dict[str, str]]
+
+
+def _bodies(
+    conn: sqlite3.Connection,
+    ids: list[str],
+    *,
+    refresh: BodyRefresher | None = None,
+) -> dict[str, str]:
+    """Fetch block bodies from the index, repairing any that lag their files.
+
+    Bodies come from the index because that is what makes assembly one query
+    rather than one file read per candidate. The cost is that an edit made
+    outside the API -- a hand edit, a ``git pull``, a sync tool -- leaves the
+    row stale with nothing on the read path to notice, and a context pack is
+    where a stale body does the most damage: the model reads it as current and
+    states it confidently.
+
+    Every row carries the ``mtime_ns`` it was indexed at, so ``refresh`` is
+    given the candidates whose stored mtime is worth re-checking and returns
+    the bodies it could re-read. mtime is a filter, not proof -- ``verify``
+    compares content hashes, which is the authority -- but it is one ``stat``
+    per block and it catches every realistic outside edit.
+    """
     if not ids:
         return {}
     placeholders = ", ".join("?" * len(ids))
-    return {
-        row["id"]: row["body"]
-        for row in conn.execute(
-            f"SELECT id, body FROM memories WHERE id IN ({placeholders})",
-            ids,
-        )
-    }
+    rows = conn.execute(
+        f"SELECT id, body, path, mtime_ns FROM memories WHERE id IN ({placeholders})",
+        ids,
+    ).fetchall()
+    bodies = {row["id"]: row["body"] for row in rows}
+
+    if refresh is None:
+        return bodies
+
+    # A stored 0 means the mtime was never recorded (the column's default, or
+    # an unreadable file at index time). There is nothing to compare against,
+    # so the row is served as-is and `verify` is left to report it; checking
+    # anyway would re-read those files on every single call.
+    candidates = [(row["id"], row["path"], row["mtime_ns"]) for row in rows if row["mtime_ns"]]
+    if candidates:
+        bodies.update(refresh(candidates))
+    return bodies
 
 
 def get_context(
@@ -206,6 +245,7 @@ def get_context(
     include_profile: bool = True,
     seed_count: int = 5,
     candidate_limit: int = 60,
+    refresh: BodyRefresher | None = None,
 ) -> ContextResult:
     """Build a context pack for ``query`` within ``token_budget``.
 
@@ -230,7 +270,7 @@ def get_context(
         profile_hits = profile_memories(
             conn, limit=20, sensitivity_max=base_filters.sensitivity_max
         )
-        bodies = _bodies(conn, [h.memory_id for h in profile_hits])
+        bodies = _bodies(conn, [h.memory_id for h in profile_hits], refresh=refresh)
         for hit in profile_hits:
             block = _make_block(
                 hit,
@@ -268,7 +308,7 @@ def get_context(
         stage = "recent"
 
     hits = _dedupe_to_tips(conn, hits, chosen)
-    bodies = _bodies(conn, [h.memory_id for h in hits])
+    bodies = _bodies(conn, [h.memory_id for h in hits], refresh=refresh)
     seeds: list[tuple[str, float]] = []
     for hit in hits:
         block = _make_block(
@@ -301,7 +341,7 @@ def get_context(
                     continue
                 weight = EDGE_WEIGHT.get(rel.relation, 0.3)
                 score = 0.6 * parent_score * weight / max(rel.hop, 1)
-                body = _bodies(conn, [rel.memory_id]).get(rel.memory_id, "")
+                body = _bodies(conn, [rel.memory_id], refresh=refresh).get(rel.memory_id, "")
                 text = _block_text(rel.title, body)
                 block = ContextBlock(
                     memory_id=rel.memory_id,
