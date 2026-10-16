@@ -1,6 +1,7 @@
 ---
 name: memory-recall
 description: Look up what is already known about the user before answering. Use when the request touches their preferences, history, prior decisions, people, projects, or tools; at the start of any task where prior context would change the answer; and whenever they say "remember when", "as I mentioned", "my usual", "like last time", or refer to something as already settled.
+x-memory-version: 0.1.0
 ---
 
 # Recalling memory
@@ -10,9 +11,9 @@ description: Look up what is already known about the user before answering. Use 
 - Need specific memories → `search`
 - Have an id, need full text or history → `get` / `related`
 
-All commands: `uv run python -m memory <cmd>` from the project, or `mem <cmd>`
-if installed. stdout is one JSON document; `--root PATH` or `$MEMORY_ROOT`
-selects the data directory.
+All commands are `mem <cmd>`. stdout is one JSON document; `--root PATH` or
+`$MEMORY_ROOT` selects the data directory. If `mem` is not on PATH, the system
+is not installed — say so rather than guessing at stored knowledge.
 
 ## context — the default
 
