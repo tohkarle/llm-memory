@@ -347,20 +347,114 @@ def init(ctx: click.Context, force: bool) -> None:
     run("init", action)
 
 
+@main.command(name="persona")
+@click.option(
+    "--print",
+    "print_text",
+    is_flag=True,
+    help="Write the persona to stdout as plain text, for piping into a system prompt.",
+)
+@click.option(
+    "--inline-skills",
+    is_flag=True,
+    help="Include the skill bodies, for a harness that does not load skills.",
+)
+@click.option(
+    "--agent-dir",
+    type=click.Path(path_type=Path),
+    envvar=install_mod.AGENT_DIR_ENV_VAR,
+    help="Agent config directory [default: $MEMORY_AGENT_DIR or ./.claude].",
+)
+def persona_cmd(print_text: bool, inline_skills: bool, agent_dir: Path | None) -> None:
+    """The always-loaded instructions: own the memory, delegate the execution.
+
+    `mem install --persona` merges these into the agent's CLAUDE.md, which
+    covers a harness that reads one. `--print` is for every other runtime:
+
+        claude --append-system-prompt "$(mem persona --print)"
+
+    and an SDK caller passes the same text as its system prompt.
+    """
+    resolved = install_mod.resolve_agent_dir(agent_dir)
+    if print_text:
+        # The one command that does not emit JSON. Its entire purpose is to
+        # be interpolated into another tool's prompt argument, and a caller
+        # doing that cannot pipe through `jq` -- a quoted JSON string would
+        # arrive at the model complete with its escapes.
+        text = install_mod.persona_block(inline_skills=inline_skills, agent_dir=resolved)
+        click.echo(_strip_markers(text))
+        return
+
+    def action() -> dict[str, Any]:
+        return {
+            "version": __version__,
+            "inline_skills": inline_skills,
+            "target": str(resolved / install_mod.PERSONA_FILE),
+            "text": _strip_markers(
+                install_mod.persona_block(inline_skills=inline_skills, agent_dir=resolved)
+            ),
+        }
+
+    run("persona", action)
+
+
+def _strip_markers(block: str) -> str:
+    """Drop the marker lines, which belong to the installed file only.
+
+    They exist so a re-run can find its own previous work inside a user's
+    CLAUDE.md. Piped into a system prompt they are noise the model reads.
+    """
+    lines = [
+        line
+        for line in block.split("\n")
+        if line.strip() not in (install_mod.PERSONA_MARKER, install_mod.PERSONA_MARKER_END)
+        and not line.strip().startswith("<!-- personal-ai-memory ")
+    ]
+    return "\n".join(lines).strip()
+
+
 @main.command(name="install")
 @click.option(
     "--skills/--no-skills",
     default=False,
     help="Copy the bundled agent skills into the agent config directory.",
 )
+@click.option(
+    "--persona/--no-persona",
+    default=False,
+    help="Merge the always-loaded instructions into the agent's CLAUDE.md.",
+)
+@click.option(
+    "--inline-skills",
+    is_flag=True,
+    help="Carry the skill bodies into the persona block, for a harness that does not load skills.",
+)
+@click.option(
+    "--persona-target",
+    type=click.Path(path_type=Path),
+    help=(
+        "Write the persona to this file instead of <agent-dir>/CLAUDE.md. "
+        "Use ./CLAUDE.md to scope the rules to one project."
+    ),
+)
+@click.option(
+    "--portable",
+    is_flag=True,
+    help="Also write AGENTS.md and .agents/skills/, for runtimes that are not Claude Code.",
+)
 @click.option("--mcp", is_flag=True, help="Register the MCP server in settings.json.")
 @click.option("--shell-env", is_flag=True, help="Export MEMORY_ROOT from your shell profile.")
-@click.option("--all", "all_steps", is_flag=True, help="Shorthand for --skills --mcp --shell-env.")
+@click.option(
+    "--all",
+    "all_steps",
+    is_flag=True,
+    help="Shorthand for --skills --persona --mcp --shell-env.",
+)
 @click.option(
     "--agent-dir",
     type=click.Path(path_type=Path),
     envvar=install_mod.AGENT_DIR_ENV_VAR,
-    help="Agent config directory [default: $MEMORY_AGENT_DIR or ~/.claude].",
+    help="Agent config directory [default: $MEMORY_AGENT_DIR or ./.claude].",
 )
 @click.option(
     "--profile",
@@ -375,6 +469,10 @@ def init(ctx: click.Context, force: bool) -> None:
 def install_cmd(
     ctx: click.Context,
     skills: bool,
+    persona: bool,
+    inline_skills: bool,
+    persona_target: Path | None,
+    portable: bool,
     mcp: bool,
     shell_env: bool,
     all_steps: bool,
@@ -383,7 +481,7 @@ def install_cmd(
     force: bool,
     dry_run: bool,
 ) -> None:
-    """Finish the install: data root, agent skills, MCP wiring, shell env.
+    """Finish the install: data root, agent skills, persona, MCP, shell env.
 
     Idempotent -- safe to re-run from a provisioning script.
     """
@@ -393,6 +491,10 @@ def install_cmd(
             root=ctx.obj.get("root"),
             agent_dir=agent_dir,
             skills=skills or all_steps,
+            persona=persona or all_steps,
+            inline_skills=inline_skills,
+            persona_target=persona_target,
+            portable=portable,
             mcp=mcp or all_steps,
             shell_env=shell_env or all_steps,
             profile=profile,
@@ -1036,7 +1138,7 @@ def verify(ctx: click.Context) -> None:
     "--agent-dir",
     type=click.Path(path_type=Path),
     envvar=install_mod.AGENT_DIR_ENV_VAR,
-    help="Agent config directory to check [default: $MEMORY_AGENT_DIR or ~/.claude].",
+    help="Agent config directory to check [default: $MEMORY_AGENT_DIR or ./.claude].",
 )
 @click.pass_context
 def doctor(ctx: click.Context, agent_dir: Path | None) -> None:
@@ -1052,6 +1154,7 @@ def doctor(ctx: click.Context, agent_dir: Path | None) -> None:
         # Lives here rather than in the API because it inspects the agent's
         # config directory, which is not part of a memory root.
         report["agent_skills"] = install_mod.skills_health(agent_dir)
+        report["agent_persona"] = install_mod.persona_health(agent_dir)
         return report
 
     run("doctor", action)

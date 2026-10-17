@@ -31,18 +31,34 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
-from .agent_assets import SKILL_NAMES, skill_source, skill_version
+from .agent_assets import (
+    SKILL_NAMES,
+    persona_text,
+    skill_source,
+    skill_version,
+)
 from .paths import ENV_VAR, Paths
 
-#: Where the data root goes when the caller names none. Under ``$HOME`` and
-#: not the CWD: a sandbox's working directory is frequently a scratch checkout
-#: that gets deleted, and losing the memory corpus with it is the one failure
-#: this system exists to prevent.
-DEFAULT_ROOT = Path("~/.memory")
+#: Where the data root goes when the caller names none: the working
+#: directory, so that a default install writes nothing outside the tree it
+#: was run in. An agent in a sandbox frequently *cannot* write to ``$HOME``,
+#: and one that can should not have a corpus appear there as a side effect
+#: of a command about something else.
+#:
+#: The cost is real and belongs in the docs rather than in a different
+#: default: a corpus under a scratch checkout dies with the checkout. Where
+#: the data must outlive the directory, name the root -- ``--root`` or
+#: ``$MEMORY_ROOT`` -- and keep it somewhere durable.
+DEFAULT_ROOT = Path(".")
 
-#: Agent config directory. Claude Code reads skills from ``<dir>/skills`` and
-#: MCP servers from ``<dir>/settings.json``.
-DEFAULT_AGENT_DIR = Path("~/.claude")
+#: Agent config directory. Claude Code reads skills from ``<dir>/skills``
+#: and MCP servers from ``<dir>/settings.json``.
+#:
+#: Local for the same reason as the root: installing a memory system is not
+#: a licence to edit the user's global agent configuration. ``--agent-dir
+#: ~/.claude`` still installs globally for someone who wants that, and says
+#: so explicitly.
+DEFAULT_AGENT_DIR = Path("./.claude")
 
 #: Overrides the agent config directory, the way ``$MEMORY_ROOT`` overrides
 #: the data root. An agent confined to its working directory installs skills
@@ -66,6 +82,31 @@ FALLBACK_PROFILE = ".profile"
 #: recognize its own previous work instead of appending a second copy.
 ENV_MARKER = "# >>> personal-ai-memory >>>"
 ENV_MARKER_END = "# <<< personal-ai-memory <<<"
+
+#: File the persona is merged into. Claude Code loads it at session start
+#: without being asked, which is the one property a skill cannot offer:
+#: skills are selected by the model, so nothing in them is guaranteed to
+#: reach a fresh agent's first turn.
+PERSONA_FILE = "CLAUDE.md"
+
+#: The cross-runtime counterpart, written beside it. Cursor, Codex, Copilot
+#: and others read ``AGENTS.md``; Claude Code reads ``CLAUDE.md``. Same
+#: text, two filenames, because the convention is split and a system that
+#: claims to work with any agent cannot pick one and call it portable.
+PERSONA_FILE_PORTABLE = "AGENTS.md"
+
+#: Cross-runtime skills location, the counterpart to ``.claude/skills``.
+#: Written relative to the directory holding the agent config rather than
+#: inside it: ``.claude/`` is one runtime's directory, and a second
+#: runtime's skills do not belong under it.
+PORTABLE_SKILLS_DIR = Path(".agents") / "skills"
+
+#: Markers bounding the block we manage inside that file. Same device as the
+#: shell profile's: the file belongs to the user and carries their own
+#: instructions, so a re-run has to recognize its previous work rather than
+#: append a second copy or overwrite the lot.
+PERSONA_MARKER = "<!-- >>> personal-ai-memory >>> -->"
+PERSONA_MARKER_END = "<!-- <<< personal-ai-memory <<< -->"
 
 #: Dependency sets a caller can ask for by name. These are reported as the
 #: command to run, not installed: `mem install` runs *inside* the environment
@@ -93,7 +134,12 @@ def resolve_agent_dir(agent_dir: Path | None = None) -> Path:
     env = os.environ.get(AGENT_DIR_ENV_VAR)
     if env:
         return Path(env).expanduser().resolve()
-    return DEFAULT_AGENT_DIR.expanduser()
+    # Resolved like the other two branches: the default is relative now, and
+    # an unresolved path would report as "./.claude" while comparing unequal
+    # to the same directory named absolutely -- which reads to the caller as
+    # a non-default dir and triggers a warning about an env var they do not
+    # need.
+    return DEFAULT_AGENT_DIR.expanduser().resolve()
 
 
 @dataclass
@@ -161,8 +207,20 @@ def install_root(root: Path, *, dry_run: bool) -> Step:
 # ---------------------------------------------------------------- skills
 
 
-def install_skills(agent_dir: Path, *, dry_run: bool, force: bool = False) -> Step:
+def install_skills(
+    agent_dir: Path,
+    *,
+    dry_run: bool,
+    force: bool = False,
+    portable: bool = False,
+) -> Step:
     """Copy the bundled skills into the agent's skills directory.
+
+    With ``portable``, they also go to ``.agents/skills/`` beside it -- the
+    cross-runtime location, for a harness that is not Claude Code. The two
+    are copies of one source rather than a link, because a link is not what
+    survives a ``git clone`` on every platform, and a drifted hand-made copy
+    is the failure this is replacing.
 
     A skill already present is overwritten only when its version stamp
     differs from ours or ``force`` is set. The stamp is what makes an upgrade
@@ -171,6 +229,10 @@ def install_skills(agent_dir: Path, *, dry_run: bool, force: bool = False) -> St
     front of the model.
     """
     dest_root = agent_dir.expanduser() / "skills"
+    # Beside the agent dir, not inside it: `.claude/` belongs to one
+    # runtime, and another runtime's skills do not live under it.
+    portable_root = agent_dir.expanduser().parent / PORTABLE_SKILLS_DIR
+    dest_roots = [dest_root, portable_root] if portable else [dest_root]
     installed: list[str] = []
     updated: list[str] = []
     skipped: list[str] = []
@@ -184,25 +246,45 @@ def install_skills(agent_dir: Path, *, dry_run: bool, force: bool = False) -> St
             warnings.append(f"{name}: bundled SKILL.md missing from the installed package")
             continue
 
-        dest = dest_root / name
-        dest_md = dest / "SKILL.md"
-        if dest_md.is_file() and not force:
-            have = skill_version(dest_md)
-            if have == __version__:
-                skipped.append(name)
-                continue
-            updated.append(f"{name} ({have or 'unstamped'} -> {__version__})")
-        elif dest_md.is_file():
-            updated.append(f"{name} (forced)")
-        else:
-            installed.append(name)
+        # Each destination is judged on its own: a current copy under
+        # `.claude` must not mask a missing or stale one under `.agents`,
+        # which is exactly how a second location silently rots.
+        states: list[str] = []
+        for root in dest_roots:
+            dest_md = root / name / "SKILL.md"
+            if dest_md.is_file() and not force:
+                have = skill_version(dest_md)
+                # Content, not just the stamp. A stamp alone cannot see an
+                # edit made within one release -- the bundled skill changes
+                # and the version does not -- which leaves a stale copy
+                # reporting itself current for the rest of the release.
+                if have == __version__ and _same_file(src.resolve() / "SKILL.md", dest_md):
+                    states.append("current")
+                    continue
+                states.append(
+                    f"{have or 'unstamped'} -> {__version__}"
+                    if have != __version__
+                    else "content changed"
+                )
+            elif dest_md.is_file():
+                states.append("forced")
+            else:
+                states.append("new")
 
-        if not dry_run:
-            # The repository ships `.claude/skills` as a symlink to the
-            # package copy. Resolving the source keeps that case from
-            # copying a link into the destination.
-            dest.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src.resolve() / "SKILL.md", dest_md)
+            if not dry_run:
+                # The repository ships `.claude/skills` as a symlink to the
+                # package copy. Resolving the source keeps that case from
+                # copying a link into the destination.
+                dest_md.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src.resolve() / "SKILL.md", dest_md)
+
+        if all(s == "current" for s in states):
+            skipped.append(name)
+        elif all(s == "new" for s in states):
+            installed.append(name)
+        else:
+            moved = next((s for s in states if s not in ("current", "new")), "refreshed")
+            updated.append(f"{name} ({moved})")
 
     # Tense follows dry_run: these strings are read by a human scanning a
     # provisioning log, where "would install" and "installed" must not blur.
@@ -220,7 +302,7 @@ def install_skills(agent_dir: Path, *, dry_run: bool, force: bool = False) -> St
         "skills",
         changed=bool(installed or updated),
         detail=detail,
-        path=str(dest_root),
+        path=" + ".join(str(r) for r in dest_roots),
         warnings=warnings,
     )
 
@@ -322,6 +404,185 @@ def _mcp_equivalent(current: Any, desired: dict[str, Any], root: Path) -> bool:
     return isinstance(args, list) and args[:2] == ["-m", "memory.mcp_server"]
 
 
+# ---------------------------------------------------------------- persona
+
+
+def persona_block(*, inline_skills: bool, agent_dir: Path) -> str:
+    """The managed block, stamped and bounded by its markers.
+
+    ``inline_skills`` carries the skill bodies into the block itself. That
+    is for the confined install, where no harness registers the skills
+    directory: a pointer there costs a tool call *and* the agent's
+    willingness to make it, and the whole reason this file exists is that
+    willingness cannot be assumed. Where a harness does load skills, the
+    pointer is right -- duplicating two long documents into every session's
+    context to say what the harness already said is pure waste.
+    """
+    body = persona_text()
+    if inline_skills:
+        parts = [body, "", "---", ""]
+        for name in SKILL_NAMES:
+            md = skill_source(name) / "SKILL.md"
+            if not md.is_file():
+                continue
+            parts.append(_strip_frontmatter(md.read_text(encoding="utf-8")).strip())
+            parts.append("")
+        body = "\n".join(parts).rstrip()
+    stamp = f"<!-- personal-ai-memory {__version__} -- edits here are overwritten -->"
+    return f"{PERSONA_MARKER}\n{stamp}\n{body}\n{PERSONA_MARKER_END}\n"
+
+
+def _same_file(src: Path, dest: Path) -> bool:
+    """Whether two files hold identical bytes.
+
+    Read rather than compared by mtime or size: these are small text files
+    a user may have hand-edited, and a same-size edit is exactly the case
+    that must not read as unchanged.
+    """
+    try:
+        return src.read_bytes() == dest.read_bytes()
+    except OSError:
+        return False
+
+
+def _strip_frontmatter(text: str) -> str:
+    """Drop a leading YAML frontmatter block.
+
+    A skill's frontmatter is addressed to the harness that registers it --
+    inlined into prose that no harness is reading, ``name:`` and
+    ``description:`` are noise competing with the instructions beneath them.
+    """
+    lines = text.split("\n")
+    if not lines or lines[0].strip() != "---":
+        return text
+    for i, line in enumerate(lines[1:], start=1):
+        if line.strip() == "---":
+            return "\n".join(lines[i + 1 :])
+    return text
+
+
+def installed_persona_version(target: Path) -> str | None:
+    """The version stamped inside the managed block, if there is one.
+
+    A line scan for the same reason ``skill_version`` is one: this runs
+    against a file a user hand-edits, and a surprise there should read as
+    "unknown version", not raise out of ``mem doctor``.
+    """
+    try:
+        text = target.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    if PERSONA_MARKER not in text:
+        return None
+    start = text.index(PERSONA_MARKER)
+    end = text.find(PERSONA_MARKER_END, start)
+    segment = text[start : end if end != -1 else len(text)]
+    for line in segment.split("\n"):
+        line = line.strip()
+        if line.startswith("<!-- personal-ai-memory "):
+            parts = line.split()
+            if len(parts) >= 3:
+                return parts[2]
+    return None
+
+
+def install_persona(
+    agent_dir: Path,
+    *,
+    dry_run: bool,
+    force: bool = False,
+    inline_skills: bool = False,
+    target: Path | None = None,
+    portable: bool = False,
+) -> Step:
+    """Merge the persona into the agent's ``CLAUDE.md``.
+
+    The file is the user's; only the marked block is ours. An unmarked file
+    is appended to, never replaced -- the instructions already in it are the
+    reason it exists.
+
+    With ``portable``, the same block also goes to ``AGENTS.md`` beside it,
+    for the runtimes that read that name instead. Both files are written in
+    full rather than one pointing at the other: a pointer is only followed
+    by an agent that chooses to, and being read without being chosen is the
+    entire reason this file exists.
+    """
+    dest = target if target is not None else agent_dir.expanduser() / PERSONA_FILE
+    block = persona_block(inline_skills=inline_skills, agent_dir=agent_dir)
+
+    if portable:
+        # AGENTS.md goes beside `.agents/`, not inside the Claude config
+        # directory: a runtime that reads AGENTS.md has no reason to look
+        # in `.claude/`, so a copy there would be read by nobody. An
+        # explicit --persona-target names one file and is honored as given.
+        portable_dest = (
+            dest.parent / PERSONA_FILE_PORTABLE
+            if target is not None
+            else agent_dir.expanduser().parent / PERSONA_FILE_PORTABLE
+        )
+        primary = _merge_persona(dest, block, dry_run=dry_run, force=force)
+        second = _merge_persona(portable_dest, block, dry_run=dry_run, force=force)
+        both = f"{primary.name_detail}; {second.name_detail}"
+        return Step(
+            "persona",
+            changed=primary.changed or second.changed,
+            detail=both,
+            path=f"{dest} + {portable_dest}",
+        )
+    return _merge_persona(dest, block, dry_run=dry_run, force=force).as_step()
+
+
+@dataclass
+class _MergeResult:
+    """What merging the block into one file did."""
+
+    path: Path
+    changed: bool
+    detail: str
+
+    @property
+    def name_detail(self) -> str:
+        return f"{self.path.name}: {self.detail}"
+
+    def as_step(self) -> Step:
+        return Step("persona", changed=self.changed, detail=self.detail, path=str(self.path))
+
+
+def _merge_persona(dest: Path, block: str, *, dry_run: bool, force: bool) -> _MergeResult:
+    """Write the managed block into one file, preserving everything else."""
+    text = dest.read_text(encoding="utf-8") if dest.is_file() else ""
+
+    if PERSONA_MARKER in text:
+        start = text.index(PERSONA_MARKER)
+        end_marker = text.find(PERSONA_MARKER_END, start)
+        if end_marker == -1:
+            raise InstallError(
+                f"{dest}: found {PERSONA_MARKER!r} with no closing "
+                f"{PERSONA_MARKER_END!r}; remove the partial block, then re-run"
+            )
+        end = end_marker + len(PERSONA_MARKER_END)
+        have = installed_persona_version(dest)
+        if text[start:end] == block.rstrip("\n") and not force:
+            return _MergeResult(dest, False, "already current")
+        moved = f"({have or 'unstamped'} -> {__version__})"
+        if dry_run:
+            return _MergeResult(dest, True, f"would update block {moved}")
+        _write_atomic(dest, text[:start] + block.rstrip("\n") + text[end:])
+        return _MergeResult(dest, True, f"updated block {moved}")
+
+    if dry_run:
+        verb = "would append block to" if text else "would create"
+        return _MergeResult(dest, True, f"{verb} {dest.name}")
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if text:
+        sep = "" if text.endswith("\n") else "\n"
+        _write_atomic(dest, f"{text}{sep}\n{block}")
+        return _MergeResult(dest, True, f"appended block to existing {dest.name}")
+    _write_atomic(dest, block)
+    return _MergeResult(dest, True, f"created {dest.name}")
+
+
 # ---------------------------------------------------------------- shell env
 
 
@@ -387,6 +648,10 @@ def install(
     root: Path | None = None,
     agent_dir: Path | None = None,
     skills: bool = False,
+    persona: bool = False,
+    inline_skills: bool = False,
+    persona_target: Path | None = None,
+    portable: bool = False,
     mcp: bool = False,
     shell_env: bool = False,
     profile: str = "minimal",
@@ -410,7 +675,20 @@ def install(
 
     steps: list[Step] = [install_root(resolved_root, dry_run=dry_run)]
     if skills:
-        steps.append(install_skills(resolved_agent, dry_run=dry_run, force=force))
+        steps.append(
+            install_skills(resolved_agent, dry_run=dry_run, force=force, portable=portable)
+        )
+    if persona:
+        steps.append(
+            install_persona(
+                resolved_agent,
+                dry_run=dry_run,
+                force=force,
+                inline_skills=inline_skills,
+                target=persona_target,
+                portable=portable,
+            )
+        )
     if mcp:
         steps.append(install_mcp(resolved_agent, resolved_root, dry_run=dry_run))
     if shell_env:
@@ -426,18 +704,24 @@ def install(
     extras = PROFILES[profile]
     warnings = [w for s in steps for w in s.warnings]
 
-    # Warn when the environment will not find the root on its own. A caller
-    # who skipped --shell-env needs to know their next `mem` call will not
-    # see this root unless they pass --root.
-    if not dry_run and not shell_env and os.environ.get(ENV_VAR) != str(resolved_root):
-        warnings.append(f"{ENV_VAR} is not set to {resolved_root}; pass --root or export it")
+    # Warn only when the environment genuinely will not find this root.
+    # Discovery walks up from the working directory to the root marker, so a
+    # root at or above the CWD needs no variable at all -- and saying
+    # otherwise teaches the reader that an unset $MEMORY_ROOT is a missing
+    # step, which invites them to "fix" it with a path that points at an
+    # empty tree.
+    if not dry_run and not shell_env and not _discoverable(resolved_root):
+        warnings.append(
+            f"{resolved_root} is not discoverable from the working directory; "
+            f"pass --root or export {ENV_VAR}"
+        )
 
-    # Same for a non-default agent dir: later commands look under $HOME
-    # unless told otherwise, which would report the skills as missing.
+    # Same test for the agent dir, which has no ancestor walk: a later
+    # command looks at the default unless the variable names this one.
     if (
         not dry_run
-        and skills
-        and resolved_agent != DEFAULT_AGENT_DIR.expanduser()
+        and (skills or persona)
+        and resolved_agent != DEFAULT_AGENT_DIR.expanduser().resolve()
         and os.environ.get(AGENT_DIR_ENV_VAR) != str(resolved_agent)
     ):
         warnings.append(
@@ -488,6 +772,52 @@ def skills_health(agent_dir: Path | None = None) -> dict[str, Any]:
     }
     if stale:
         out["hint"] = "run `mem install --skills` to install or refresh"
+    return out
+
+
+def _discoverable(root: Path) -> bool:
+    """Whether ``Paths.discover`` would find this root with no variable set.
+
+    True when the root is the working directory or an ancestor of it: the
+    walk starts at the CWD and climbs. Anything else -- a sibling directory,
+    a path under ``$HOME`` while the shell sits elsewhere -- needs
+    ``$MEMORY_ROOT`` or an explicit ``--root`` on every later call.
+    """
+    if os.environ.get(ENV_VAR) == str(root):
+        return True
+    try:
+        cwd = Path.cwd().resolve()
+    except OSError:
+        return False
+    return root == cwd or root in cwd.parents
+
+
+def persona_health(agent_dir: Path | None = None) -> dict[str, Any]:
+    """Whether the always-loaded instructions are in place, for ``doctor``.
+
+    Reported, not repaired, like the skills: this writes into a file the
+    user owns and may have reorganized, and ``doctor`` is read-only.
+    """
+    dest = resolve_agent_dir(agent_dir) / PERSONA_FILE
+    if not dest.is_file():
+        return {
+            "path": str(dest),
+            "installed": False,
+            "expected_version": __version__,
+            "hint": "run `mem install --persona` to install",
+        }
+    found = installed_persona_version(dest)
+    text = dest.read_text(encoding="utf-8")
+    present = PERSONA_MARKER in text
+    out: dict[str, Any] = {
+        "path": str(dest),
+        "installed": present,
+        "version": found,
+        "current": present and found == __version__,
+        "expected_version": __version__,
+    }
+    if not out["current"]:
+        out["hint"] = "run `mem install --persona` to install or refresh"
     return out
 
 

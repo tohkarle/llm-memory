@@ -83,11 +83,14 @@ dev = [
 [tool.hatch.build.targets.wheel]
 packages = ["memory"]
 only-include = ["memory", "mem_launcher.py"]
-# The bundled skills are data, not modules, so they are not picked up by
-# package discovery. They are what makes the install useful to an agent, so
-# a wheel without them is a broken wheel -- `tests/test_install.py` asserts
-# they are present.
-artifacts = ["memory/agent_assets/skills/**/*.md"]
+# The bundled skills and persona are data, not modules, so they are not
+# picked up by package discovery. They are what makes the install useful to
+# an agent, so a wheel without them is a broken wheel --
+# `tests/test_install.py` asserts they are present.
+artifacts = [
+    "memory/agent_assets/skills/**/*.md",
+    "memory/agent_assets/PERSONA.md",
+]
 
 [tool.hatch.build.targets.wheel.force-include]
 "mem_launcher.py" = "mem_launcher.py"

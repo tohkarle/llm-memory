@@ -6,29 +6,37 @@ teach you when to use it.
 
 Read this if you have no memory system installed, or `mem` is not on `PATH`.
 
+> **Not for an agent working on this repository.** This guide provisions a
+> *new* sandbox. This checkout is already a memory root: its corpus is in
+> `./data/`, `mem` discovers it by walking up from the working directory,
+> and `$MEMORY_ROOT` is correctly unset. Running an installer here would
+> point your writes at an empty tree. If you are here to change the code,
+> read `./CLAUDE.md` instead.
+
 ---
 
-## 0. First: are you allowed to write outside your working directory?
+## 0. Everything stays in your working directory
 
-This matters before you run anything. `mem install --all` writes to four
-places, and three are under `$HOME`: the data root (`~/.memory`), the skills
-(`~/.claude/skills/`), the MCP entry (`~/.claude/settings.json`), and your
-shell profile.
+**`mem install` writes nothing outside the directory you run it in.** The
+corpus goes to `./data/`, the skills and persona to `./.claude/`. There is
+no `$HOME` write to opt out of, so an agent confined to its working
+directory — the usual case — can run the normal install.
 
-**If you are confined to a working directory, or are not permitted to modify
-your harness's configuration — which includes `~/.claude/` — do not run
-`--all`.** That is the correct call, not an obstacle to work around. Use
-[§1b, the confined install](#1b-confined-install-working-directory-only)
-instead. It is fully supported and gives you a working memory system.
+Two things are the exception, and both are opt-in: `--shell-env` appends to
+your shell profile, and `--mcp` writes `settings.json` in the agent config
+directory. Skip both unless you are permitted to edit your harness's
+configuration.
 
-Use §1 only if you can write to `$HOME` freely — a container you own, a
-provisioning script, or a human's shell.
+**The tradeoff this buys you, stated plainly:** a corpus under a scratch
+checkout dies with the checkout. If the sandbox is disposable and the
+memories must outlive it, pass `--root` pointing somewhere durable, and
+export `$MEMORY_ROOT` so later commands find it.
 
-## 1. Install (unrestricted)
+## 1. Install
 
 ```bash
 uv tool install git+https://github.com/tohkarle/llm-memory
-mem install --all
+mem install --skills --persona
 ```
 
 If `uv` is unavailable, `pip install git+https://github.com/tohkarle/llm-memory`
@@ -37,52 +45,53 @@ works the same way. **Python 3.12+ is required** — check with
 interpreter and the install will fail with an unsatisfiable-requirements
 error.
 
-`mem install --all` does four things, and is **idempotent** — re-run it freely,
-including from a provisioning script:
+Every step is **idempotent** — re-run it freely, including from a
+provisioning script. Paths are relative to the working directory:
 
-| step | what it does |
-| --- | --- |
-| `root` | creates and indexes the data tree at `~/.memory` |
-| `skills` | copies the two skills into `~/.claude/skills/` |
-| `mcp` | registers the MCP server in `~/.claude/settings.json` |
-| `shell_env` | exports `MEMORY_ROOT` from your shell profile |
+| step | flag | what it does |
+| --- | --- | --- |
+| `root` | always | creates and indexes the data tree at `./data/` |
+| `skills` | `--skills` | copies the two skills into `./.claude/skills/` |
+| `persona` | `--persona` | merges the standing instructions into `./.claude/CLAUDE.md` |
+| `mcp` | `--mcp` | registers the MCP server in `./.claude/settings.json` |
+| `shell_env` | `--shell-env` | exports `MEMORY_ROOT` from your shell profile |
 
-Run `mem install` with no flags to get only the data root. Use `--dry-run`
-first if you want to see what would change without writing anything.
+Add `--portable` if your harness is not Claude Code: the skills are also
+written to `./.agents/skills/`, and the persona to `./AGENTS.md`, which is
+the convention Cursor, Codex, Copilot and others read. Both copies carry
+the same text in full — a pointer from one to the other would only be
+followed by an agent that chose to.
 
-## 1b. Confined install (working directory only)
+`--all` runs all five. `--agent-dir PATH` moves the `.claude` writes
+elsewhere (`--agent-dir ~/.claude` installs globally, for a human who wants
+that); `--root PATH` moves the corpus. Run `mem install` with no flags to
+get only the data root, and `--dry-run` to see what would change without
+writing anything.
 
-Everything stays inside the working directory. Nothing is written under
-`$HOME`, and your harness's configuration is left alone.
+## 1b. No package manager, or a blocked cache
+
+If `uv tool install` cannot write where it wants, install into a virtual
+environment here instead:
 
 ```bash
-# 1. A virtual environment here, on Python 3.12+.
 uv venv .venv --python 3.12
 uv pip install --python .venv/bin/python \
   "personal-ai-memory @ git+https://github.com/tohkarle/llm-memory"
-
-# 2. Data root and skills, both local. No MCP, no shell edit.
-.venv/bin/mem --root ./.memory install --skills --agent-dir ./.claude
-
-# 3. Make both locations stick for every later command.
-export MEMORY_ROOT="$PWD/.memory"
-export MEMORY_AGENT_DIR="$PWD/.claude"
+.venv/bin/mem install --skills --persona --inline-skills
 ```
 
-Then use `.venv/bin/mem` (or add `.venv/bin` to `PATH`). Read the two skills
-at `./.claude/skills/*/SKILL.md` and follow them yourself — they will not be
-auto-registered by your harness, so apply them manually.
+Then use `.venv/bin/mem`, or add `.venv/bin` to `PATH`.
 
-**Export `MEMORY_AGENT_DIR`.** Without it, `mem doctor` looks under `$HOME`,
-finds nothing, and reports the skills as missing even though they are
-installed. `mem install` warns you if you forget.
+`--inline-skills` carries the skill text into `CLAUDE.md` itself. Use it
+when nothing in your harness registers a skills directory: a pointer to
+files you have to remember to open is not enough, and the whole point of
+the persona is that it is read without being chosen. **Read
+`./.claude/CLAUDE.md` before you start work** — with that flag it is the
+whole of what you need.
 
 If `uv` writes its cache to `$HOME` and that is blocked too, set
 `UV_CACHE_DIR="$PWD/.uv-cache"` before installing. A pre-existing
 `python3.12` avoids the download entirely.
-
-Everything else in this guide applies unchanged, except that `--root` and the
-local `mem` path are yours to supply.
 
 ## 2. Confirm it worked
 
@@ -105,22 +114,29 @@ mem doctor | jq '.data.agent_skills'
 Expect `installed: true` and `current: true` for both skills. A `hint` field
 means they are missing or stale — run `mem install --skills` to fix it.
 
-## 3. Set the root for this session
+## 3. Finding the root later
 
-`mem install --shell-env` edits your shell profile, which affects **new**
-shells, not the one you are in. For the current session, export it yourself:
+You do not normally need to do anything. `mem` discovers its root by
+walking up from the working directory to the one holding
+`data/.memory-root`, so any command run inside the tree you installed into
+is already pointed at the right corpus. **An unset `$MEMORY_ROOT` is the
+normal state, not a missing step.**
+
+Set it only when the walk cannot work — a command run from outside the
+tree, a cron job, or an MCP server launched with an unpredictable working
+directory:
 
 ```bash
-export MEMORY_ROOT=~/.memory
+export MEMORY_ROOT="$PWD/data"       # or wherever the root is
 ```
 
-Without it, every command fails with `"code": "no_root"` and exit 1 — unless
-you pass `--root PATH` explicitly. Note that `--root` is a **group-level**
-option, so it goes before the subcommand:
+`mem install --shell-env` writes that into your shell profile, for new
+shells. Note that `--root` is a **group-level** option, so it goes before
+the subcommand:
 
 ```bash
-mem --root ~/.memory search "deploy"    # correct
-mem search "deploy" --root ~/.memory    # error: no such option
+mem --root /path/to/root search "deploy"    # correct
+mem search "deploy" --root /path/to/root    # error: no such option
 ```
 
 ## 4. Verify end to end
@@ -136,11 +152,27 @@ mem create --type preference \
 mem search "uv" | jq '.data.total'
 ```
 
-## 5. Then read the skills
+## 5. Then read the instructions
 
-The two files now in `~/.claude/skills/` are the actual instructions for using
-this system — when to recall, what is worth recording, which mutation verb to
-use. This guide only gets it installed.
+`mem install --persona` writes the standing rules into
+`~/.claude/CLAUDE.md`: **you own memory and never delegate it; you delegate
+execution.** A harness that reads `CLAUDE.md` loads this at session start,
+so a fresh agent gets it without being told.
+
+For a runtime with no such file, print the same text into a real system
+prompt:
+
+```bash
+claude --append-system-prompt "$(mem persona --print)"
+```
+
+`mem persona --print --inline-skills` adds the skill bodies, for a runtime
+that loads neither. This is the one command that prints plain text rather
+than JSON — it is meant to be interpolated into another tool's argument.
+
+The two files in `~/.claude/skills/` are the detail behind those rules —
+when to recall, what is worth recording, which mutation verb to use. This
+guide only gets it installed.
 
 - `memory-recall/SKILL.md` — looking things up before you answer
 - `memory-write/SKILL.md` — what to record, and how
@@ -191,8 +223,10 @@ it, then re-run.
 - **Do not store secrets.** This is plain Markdown on disk. Memories can be
   marked secret so they stay out of `mem tags` and default search results,
   but that is hygiene, not encryption.
-- **Do not point `MEMORY_ROOT` at a directory that gets wiped** between
-  sessions. The default `~/.memory` sits outside any checkout on purpose. A
-  root inside the working directory (§1b) is correct when that is all you can
-  write to — but say so plainly, because the corpus then lives and dies with
-  that directory.
+- **Do not leave a corpus in a directory that gets wiped.** The default
+  root is the working directory, which is the right call for containment and
+  the wrong one for a disposable sandbox: the memories die with it. If the
+  checkout is durable — a repository you own, committed and backed up — a
+  local root is a legitimate choice and scopes the memories to the project,
+  the way this repository does with `./data/`. If it is not, pass `--root`
+  pointing somewhere that survives, and say plainly which you did.

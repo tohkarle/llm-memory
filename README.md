@@ -24,7 +24,7 @@ a provisioning script or a Dockerfile. `--all` does four things:
 
 | Step | What it does |
 | --- | --- |
-| `root` | Creates and indexes the data tree (default `~/.memory`) |
+| `root` | Creates and indexes the data tree (default `./data/`) |
 | `skills` | Copies the bundled agent skills into `~/.claude/skills/` |
 | `mcp` | Registers the MCP server in `~/.claude/settings.json` |
 | `shell_env` | Exports `MEMORY_ROOT` from your shell profile |
@@ -269,7 +269,12 @@ data/config/llm.json             optional LLM provider settings
 backups/                         archives, beside data/ not inside it
 ```
 
-Set `$MEMORY_ROOT` or pass `--root` to use a data directory elsewhere.
+The root is the directory holding `data/`. `mem` finds it by walking up
+from the working directory, so a corpus at or above where you run commands
+needs no configuration. `mem install` defaults to the working directory and
+writes nothing under `$HOME`; set `$MEMORY_ROOT` or pass `--root` to keep
+the corpus somewhere else — which is what you want if the working directory
+is a scratch checkout that gets deleted.
 
 ## Development
 

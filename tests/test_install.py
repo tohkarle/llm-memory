@@ -8,6 +8,7 @@ config file it does not own.
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -16,9 +17,24 @@ from click.testing import CliRunner
 
 from memory import __version__
 from memory import install as install_mod
-from memory.agent_assets import SKILL_NAMES, skill_source, skill_version
+from memory.agent_assets import (
+    SKILL_NAMES,
+    persona_source,
+    persona_text,
+    skill_source,
+    skill_version,
+)
 from memory.cli import EXIT_VALIDATION, main
-from memory.install import ENV_MARKER, MCP_SERVER_NAME, InstallError, install, skills_health
+from memory.install import (
+    ENV_MARKER,
+    MCP_SERVER_NAME,
+    PERSONA_FILE,
+    PERSONA_MARKER,
+    InstallError,
+    install,
+    persona_health,
+    skills_health,
+)
 from memory.paths import ENV_VAR, Paths
 
 
@@ -43,6 +59,39 @@ def test_every_declared_skill_ships_a_file() -> None:
         md = skill_source(name) / "SKILL.md"
         assert md.is_file(), f"{name} is declared but has no SKILL.md"
         assert skill_version(md) == __version__, f"{name} version stamp is stale"
+
+
+def test_persona_ships_a_file() -> None:
+    """Same contract as the skills: the wheel must carry it."""
+    assert persona_source().is_file(), "PERSONA.md is not in the package"
+    assert persona_text().strip(), "PERSONA.md is empty"
+
+
+def test_persona_states_both_standing_rules() -> None:
+    """The two rules are the whole reason this file is always loaded.
+
+    Asserted on substance rather than wording: if an edit drops the
+    delegation half, every fresh agent silently goes back to doing the work
+    itself, and nothing else in the system would notice.
+    """
+    text = persona_text().lower()
+    assert "mem context" in text, "persona does not tell the agent how to recall"
+    assert "never through a dispatched agent" in text, "persona does not reserve memory"
+    assert "dispatch a new agent" in text, "persona does not delegate execution"
+    assert "mem ingest" in text, "persona does not route long documents to ingest"
+
+
+def test_persona_warns_against_setting_a_root() -> None:
+    """The one failure the persona exists to prevent, after the first.
+
+    An unset `MEMORY_ROOT` looks like a missing step to an agent checking
+    its environment, and the obvious-looking repair is to export a root
+    read off some document -- which silently points writes at an empty tree
+    while discovery was already working.
+    """
+    text = persona_text()
+    assert "MEMORY_ROOT" in text, "persona does not mention the root at all"
+    assert "--root" in text, "persona does not warn off the flag"
 
 
 def test_skills_do_not_assume_a_project_checkout() -> None:
@@ -380,6 +429,251 @@ def test_profile_reports_the_install_command(tmp_path: Path) -> None:
     assert "all-media" in (full["extras_hint"] or "")
 
 
+def test_default_install_writes_nothing_under_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The containment guarantee: a bare install stays in the working tree.
+
+    An agent in a sandbox frequently cannot write to ``$HOME`` at all, and
+    one that can should not find a corpus there as a side effect of a
+    command about something else. Asserted against a fake home that is
+    watched rather than trusted: a default that drifts back under ``$HOME``
+    is the one regression this test exists to catch.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    work = tmp_path / "work"
+    work.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    monkeypatch.chdir(work)
+    monkeypatch.delenv(ENV_VAR, raising=False)
+    monkeypatch.delenv(install_mod.AGENT_DIR_ENV_VAR, raising=False)
+
+    report = install(skills=True, persona=True)
+
+    assert list(home.iterdir()) == [], "a default install wrote under $HOME"
+    assert (work / "data").is_dir(), "no corpus in the working directory"
+    assert (work / ".claude" / "skills").is_dir()
+    assert (work / ".claude" / PERSONA_FILE).is_file()
+    assert Path(report["root"]) == work.resolve()
+
+
+def test_default_install_needs_no_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A local root is discoverable, so nothing should ask for a variable.
+
+    The warning this guards used to fire whenever ``$MEMORY_ROOT`` was
+    unset, which taught the reader that the normal state was a missing step
+    -- and invited them to set it to a documented default pointing at an
+    empty tree.
+    """
+    work = tmp_path / "work"
+    work.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path / "home"))
+    monkeypatch.chdir(work)
+    monkeypatch.delenv(ENV_VAR, raising=False)
+    monkeypatch.delenv(install_mod.AGENT_DIR_ENV_VAR, raising=False)
+
+    report = install(skills=True, persona=True)
+
+    assert report["warnings"] == [], report["warnings"]
+
+
+def test_out_of_tree_root_still_warns(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A root the walk cannot reach genuinely does need a variable."""
+    work = tmp_path / "work"
+    work.mkdir()
+    elsewhere = tmp_path / "elsewhere"
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path / "home"))
+    monkeypatch.chdir(work)
+    monkeypatch.delenv(ENV_VAR, raising=False)
+
+    report = install(root=elsewhere)
+
+    assert any("not discoverable" in w for w in report["warnings"])
+
+
+def test_portable_install_writes_both_conventions(tmp_path: Path) -> None:
+    """Claude Code reads CLAUDE.md and .claude/skills; others read AGENTS.md
+    and .agents/skills. Both get the same text, in full.
+
+    AGENTS.md sits beside `.agents/`, not inside the Claude config
+    directory: a runtime that reads AGENTS.md has no reason to look in
+    `.claude/`, so a copy there would be read by nobody.
+    """
+    work = tmp_path / "work"
+    agent = work / ".claude"
+    agent.mkdir(parents=True)
+
+    install_mod.install_skills(agent, dry_run=False, portable=True)
+    install_mod.install_persona(agent, dry_run=False, portable=True)
+
+    claude_md = agent / PERSONA_FILE
+    agents_md = work / "AGENTS.md"
+    assert claude_md.is_file() and agents_md.is_file()
+    assert claude_md.read_text(encoding="utf-8") == agents_md.read_text(encoding="utf-8")
+    assert (agent / "skills" / "memory-recall" / "SKILL.md").is_file()
+    assert (work / ".agents" / "skills" / "memory-recall" / "SKILL.md").is_file()
+    assert not (agent / "AGENTS.md").exists(), "AGENTS.md hidden inside .claude/"
+
+
+def test_portable_repairs_one_destination_without_the_other(tmp_path: Path) -> None:
+    """Each copy is judged on its own, or the second one silently rots."""
+    work = tmp_path / "work"
+    agent = work / ".claude"
+    agent.mkdir(parents=True)
+    install_mod.install_skills(agent, dry_run=False, portable=True)
+    shutil.rmtree(work / ".agents")
+
+    step = install_mod.install_skills(agent, dry_run=False, portable=True)
+
+    assert step.changed, "a missing portable copy reported as current"
+    assert (work / ".agents" / "skills" / "memory-write" / "SKILL.md").is_file()
+
+
+def test_skill_content_change_within_a_release_is_detected(tmp_path: Path) -> None:
+    """A stamp alone cannot see an edit that does not bump the version.
+
+    This is not hypothetical: editing a bundled skill mid-release leaves
+    every installed copy reporting itself current until the next bump.
+    """
+    agent = tmp_path / "agent"
+    agent.mkdir()
+    install_mod.install_skills(agent, dry_run=False)
+    dest = agent / "skills" / "memory-recall" / "SKILL.md"
+    dest.write_text(
+        dest.read_text(encoding="utf-8").replace("# Recalling memory", "# Edited"),
+        encoding="utf-8",
+    )
+
+    step = install_mod.install_skills(agent, dry_run=False)
+
+    assert step.changed, "a hand-edited copy reported as current"
+    assert "# Recalling memory" in dest.read_text(encoding="utf-8")
+
+
+def test_persona_preserves_a_users_own_file(tmp_path: Path) -> None:
+    """CLAUDE.md belongs to the user; only the marked block is ours."""
+    agent = tmp_path / "agent"
+    agent.mkdir()
+    target = agent / PERSONA_FILE
+    target.write_text("# My notes\n\nAlways run pytest -x.\n", encoding="utf-8")
+
+    step = install_mod.install_persona(agent, dry_run=False)
+
+    assert step.changed
+    text = target.read_text(encoding="utf-8")
+    assert "Always run pytest -x." in text, "the user's own instructions were lost"
+    assert PERSONA_MARKER in text
+
+
+def test_persona_is_idempotent(tmp_path: Path) -> None:
+    """A re-run replaces its own block rather than stacking a second copy."""
+    agent = tmp_path / "agent"
+    agent.mkdir()
+
+    first = install_mod.install_persona(agent, dry_run=False)
+    second = install_mod.install_persona(agent, dry_run=False)
+
+    assert first.changed and not second.changed
+    text = (agent / PERSONA_FILE).read_text(encoding="utf-8")
+    assert text.count(PERSONA_MARKER) == 1
+
+
+def test_persona_refreshes_a_stale_block(tmp_path: Path) -> None:
+    """An older stamp is what makes an upgrade detectable."""
+    agent = tmp_path / "agent"
+    agent.mkdir()
+    target = agent / PERSONA_FILE
+    install_mod.install_persona(agent, dry_run=False)
+    target.write_text(
+        target.read_text(encoding="utf-8").replace(
+            f"personal-ai-memory {__version__}", "personal-ai-memory 0.0.1"
+        ),
+        encoding="utf-8",
+    )
+
+    step = install_mod.install_persona(agent, dry_run=False)
+
+    assert step.changed
+    assert "0.0.1" in step.detail and __version__ in step.detail
+    assert (agent / PERSONA_FILE).read_text(encoding="utf-8").count(PERSONA_MARKER) == 1
+
+
+def test_persona_unclosed_marker_is_an_error(tmp_path: Path) -> None:
+    """Half a block means a hand-edit went wrong; refuse rather than guess."""
+    agent = tmp_path / "agent"
+    agent.mkdir()
+    (agent / PERSONA_FILE).write_text(f"{PERSONA_MARKER}\nstuff\n", encoding="utf-8")
+
+    with pytest.raises(InstallError, match="no closing"):
+        install_mod.install_persona(agent, dry_run=False)
+
+
+def test_persona_inlines_skills_for_a_confined_install(tmp_path: Path) -> None:
+    """Where no harness registers the skills, a pointer to them is not enough.
+
+    The confined install has nothing that auto-loads the skills directory,
+    so the block has to carry the instructions themselves -- minus the
+    frontmatter, which is addressed to a registrar that is not there.
+    """
+    agent = tmp_path / "agent"
+    agent.mkdir()
+
+    install_mod.install_persona(agent, dry_run=False, inline_skills=True)
+
+    text = (agent / PERSONA_FILE).read_text(encoding="utf-8")
+    assert "# Recalling memory" in text
+    assert "# Writing memory" in text
+    assert "name: memory-recall" not in text, "skill frontmatter leaked into the block"
+
+
+def test_persona_target_scopes_the_rules_to_one_project(tmp_path: Path) -> None:
+    """A project-local CLAUDE.md is the point of --persona-target.
+
+    The default lands in the agent dir, which is user-global; a repo root
+    wants the file itself, and the rules then travel with the checkout
+    rather than following the user into every other project.
+    """
+    agent = tmp_path / "agent"
+    agent.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    target = repo / "CLAUDE.md"
+
+    step = install_mod.install_persona(agent, dry_run=False, target=target)
+
+    assert step.changed
+    assert PERSONA_MARKER in target.read_text(encoding="utf-8")
+    assert not (agent / PERSONA_FILE).exists(), "wrote to the agent dir as well"
+
+
+def test_persona_dry_run_writes_nothing(tmp_path: Path) -> None:
+    agent = tmp_path / "agent"
+    agent.mkdir()
+
+    step = install_mod.install_persona(agent, dry_run=True)
+
+    assert step.changed
+    assert not (agent / PERSONA_FILE).exists()
+
+
+def test_persona_health_reports_missing_then_current(tmp_path: Path) -> None:
+    agent = tmp_path / "agent"
+    agent.mkdir()
+
+    missing = persona_health(agent)
+    assert missing["installed"] is False
+    assert "hint" in missing
+
+    install_mod.install_persona(agent, dry_run=False)
+    healthy = persona_health(agent)
+    assert healthy["installed"] is True
+    assert healthy["current"] is True
+    assert "hint" not in healthy
+
+
 def test_skills_health_reports_missing_then_current(tmp_path: Path) -> None:
     agent = tmp_path / "agent"
     before = skills_health(agent)
@@ -444,7 +738,7 @@ def test_cli_all_flag_runs_every_step(
     )
     assert result.exit_code == 0, result.output
     steps = {s["step"] for s in json.loads(result.stdout)["data"]["steps"]}
-    assert steps == {"root", "skills", "mcp", "shell_env"}
+    assert steps == {"root", "skills", "persona", "mcp", "shell_env"}
 
 
 def test_cli_install_failure_is_a_classified_envelope(runner: CliRunner, tmp_path: Path) -> None:

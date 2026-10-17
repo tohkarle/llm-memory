@@ -19,6 +19,14 @@ SKILL_NAMES: tuple[str, ...] = ("memory-recall", "memory-write")
 #: Frontmatter key naming the package version a skill copy shipped with.
 VERSION_KEY = "x-memory-version"
 
+#: The always-loaded instructions. Skills are *selected* by the model, so
+#: nothing in them is guaranteed to be read; this file is merged into the
+#: agent's ``CLAUDE.md``, which a harness loads at session start without
+#: being asked. It carries the rules that must survive a fresh agent's first
+#: turn -- own the memory, delegate the execution -- and points at the
+#: skills for the detail.
+PERSONA_NAME = "PERSONA.md"
+
 
 def skills_dir() -> Path:
     """Directory holding the bundled skills.
@@ -57,3 +65,18 @@ def skill_version(skill_md: Path) -> str | None:
         if sep and key.strip() == VERSION_KEY:
             return value.strip() or None
     return None
+
+
+def persona_source() -> Path:
+    """The bundled persona Markdown."""
+    return Path(__file__).resolve().parent / PERSONA_NAME
+
+
+def persona_text() -> str:
+    """Contents of the bundled persona, without the version stamp.
+
+    The stamp belongs to the installed block rather than the asset: it is
+    written as a marker comment by the installer, which is the only place
+    that knows whether this is a fresh write or a refresh.
+    """
+    return persona_source().read_text(encoding="utf-8").strip()
